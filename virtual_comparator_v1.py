@@ -25,7 +25,7 @@ Primary defect metric: k_worst_mean
   Negative = pull-in.  Positive = proud.
 
 Usage:
-  python virtual_comparator_v1.py --ply data/pc/Surface8_clean.ply
+      python virtual_comparator_v1.py --ply data/pc/Surface8_clean.ply
   python virtual_comparator_v1.py --ply data/pc/Surface8_clean.ply \\
       --r-inner 1.5 --r-outer 7 --n-sectors 8 --k-sectors 4 \\
       --threshold -0.2
@@ -95,8 +95,8 @@ def parse_args():
                         "If no nominal candidate found, falls back to least-red in the band.")
     p.add_argument("--zero-from-edge-min", type=float, default=13.0,
                    help="Min distance from hole edge to zero center (mm)")
-    p.add_argument("--zero-from-edge-max", type=float, default=40.0,
-                   help="Max distance from hole edge to zero center (mm) — 4 cm physical limit")
+    p.add_argument("--zero-from-edge-max", type=float, default=60.0,
+                   help="Max distance from hole edge to zero center (mm) — NTA 70901 allows up to 5-6 cm")
 
     # Deviation map (for green-zone detection)
     p.add_argument("--grid-res",      type=float, default=0.4,  help="Grid resolution (mm)")
@@ -120,6 +120,19 @@ def parse_args():
                         "The script retries with smaller radii down to --feet-radius-min.")
     p.add_argument("--feet-radius-min", type=float, default=6.0,
                    help="Minimum feet radius tried when full radius puts feet off-panel (mm)")
+
+    # Measurement mode
+    p.add_argument("--measure-mode", choices=["plane", "deviation", "local-poly"],
+                   default="plane",
+                   help="plane: signed distance to 3-foot local plane (default). "
+                        "deviation: deviation-map residual (global curvature removed). "
+                        "local-poly: polynomial fit to the nominal ring outside the crown — "
+                        "avoids the curved-surface bias of the plane approach without "
+                        "relying on a global panel fit.")
+    p.add_argument("--local-poly-fit-radius", type=float, default=30.0,
+                   help="[local-poly] radius (mm) of the local fitting region around the rivet")
+    p.add_argument("--local-poly-degree", type=int, default=2,
+                   help="[local-poly] degree of the 2-D polynomial fit (default 2 = quadratic)")
 
     # Output
     p.add_argument("--interactive", action=argparse.BooleanOptionalAction, default=True,
@@ -246,7 +259,7 @@ def auto_r_outer(holes):
 # ── Auto-zero point search ────────────────────────────────────────────────────
 def find_zero_point(rivet_center, hole_radius, pts, kdtree, deviation,
                     nominal_thresh=0.10, from_edge_min=13.0, from_edge_max=60.0,
-                    feet_radius=13.7,
+                    feet_radius=13.7, crown_buffer=0.0,
                     other_centers=None, other_radii=None,
                     mastic_centers=None, mastic_radii=None,
                     mastic_bound_tree=None, mastic_bound_r=3.0):
@@ -262,6 +275,10 @@ def find_zero_point(rivet_center, hole_radius, pts, kdtree, deviation,
          Among those, take the nearest.
       2. If no nominal candidate exists, take the one with the highest
          deviation (least red) among all non-excluded candidates.
+
+    crown_buffer: extra exclusion radius added to each neighbouring rivet's
+    hole radius.  Set to r_outer so that the zero point cannot fall inside
+    any rivet's deformation zone — avoids zeroing towards rivet rows.
 
     Excludes zones covered by other rivet holes or mastic.
 
@@ -280,9 +297,9 @@ def find_zero_point(rivet_center, hole_radius, pts, kdtree, deviation,
     if len(idxs) == 0:
         return None
 
-    # Exclude: probe center must not be over another rivet hole or mastic.
-    # (For zeroing we only care that the probe reads panel surface, not a hole.
-    #  Feet landing near another rivet is acceptable.)
+    # Exclude neighbouring rivet holes + their deformation zone (crown_buffer).
+    # This prevents the zero point falling inside another rivet's pull-in region,
+    # which would cause the zero to be biased toward that rivet's depression.
     probe_r = 4.0   # default probe disc radius
     if other_centers is not None and len(other_centers) > 0:
         keep = np.ones(len(idxs), dtype=bool)
@@ -290,7 +307,7 @@ def find_zero_point(rivet_center, hole_radius, pts, kdtree, deviation,
             if np.linalg.norm(np.asarray(oc[:2]) - rivet_center[:2]) < 1e-3:
                 continue
             d_oc = np.linalg.norm(pts[idxs, :2] - np.asarray(oc[:2]), axis=1)
-            keep &= d_oc > (or_ + probe_r)
+            keep &= d_oc > (or_ + probe_r + crown_buffer)
         idxs, d2d = idxs[keep], d2d[keep]
 
     # Mastic exclusion is stricter: avoid comparator landing on mastic material
@@ -340,6 +357,24 @@ def zero_reading_at(zero_center, pts, kdtree, feet_radius, probe_radius,
     return float(dists.mean())
 
 
+def deviation_zero_reading(zero_center, pts, kdtree, deviation, probe_radius):
+    """Median deviation-map value in a disc of probe_radius around zero_center."""
+    idxs = np.array(kdtree.query_ball_point(zero_center, probe_radius), dtype=np.int32)
+    if len(idxs) == 0:
+        return None
+    return float(np.median(deviation[idxs]))
+
+
+# ── Local polynomial helper ───────────────────────────────────────────────────
+def _poly2d_basis(x, y, degree):
+    """Vandermonde matrix for a 2-D polynomial up to `degree`."""
+    cols = []
+    for d in range(degree + 1):
+        for i in range(d + 1):
+            cols.append(x ** (d - i) * y ** i)
+    return np.column_stack(cols)
+
+
 # ── Crown measurement with sector analysis ────────────────────────────────────
 def measure_crown_v1(rivet_center, hole_radius, pts, kdtree,
                      feet_radius, r_inner_mm, r_outer_mm,
@@ -349,7 +384,9 @@ def measure_crown_v1(rivet_center, hole_radius, pts, kdtree,
                      other_hole_centers=None, other_hole_radii=None,
                      mastic_centers=None, mastic_radii=None,
                      mastic_bound_tree=None, mastic_bound_r=3.0,
-                     min_sector_coverage=0.3):
+                     min_sector_coverage=0.3,
+                     deviation_arr=None, measure_mode="plane",
+                     local_poly_fit_radius=30.0, local_poly_degree=2):
     """
     Measure the annular crown [hole_r+r_inner, hole_r+r_outer] around a rivet.
 
@@ -362,6 +399,15 @@ def measure_crown_v1(rivet_center, hole_radius, pts, kdtree,
     on the consensus_band.
 
     Returns a dict with all metrics, or None if too few crown points.
+
+    --- Known limitation of measure_mode="plane" ---
+    If a foot lands inside the pull-in zone of THIS rivet (depressed by δ),
+    the 3-foot plane tilts toward that foot and the measurement at any probe
+    point shifts by approximately δ/3 (appears falsely proud).  In practice
+    the feet sit ~13-20 mm from the rivet centre, where pull-in depression is
+    usually < 0.05 mm, so the bias is < 0.02 mm — negligible for normal rivets.
+    It becomes relevant for very large deformation zones (A > 15 mm radius) or
+    in dense arrays where a foot lands in a neighbouring rivet's depression.
     """
     plane_n, foot_pts, actual_feet_r, foot_max_dist, foot_ok = find_valid_plane(
         rivet_center, pts, kdtree, feet_radius, foot_dist_max, feet_radius_min,
@@ -402,14 +448,62 @@ def measure_crown_v1(rivet_center, hole_radius, pts, kdtree,
     if mastic_bound_tree is not None:
         d_boundary, _ = mastic_bound_tree.query(crown_pts[:, :2])
         valid_crown &= d_boundary >= mastic_bound_r
+    crown_idx  = crown_idx[valid_crown]
     crown_pts  = crown_pts[valid_crown]
     d2d_crown  = d2d_crown[valid_crown]
 
     if len(crown_pts) < max(n_sectors * n_radial_bands, 5):
         return None
 
-    # Signed distance to comparator plane, corrected by zero reading
-    dists = signed_distances(crown_pts, plane_n, foot_pts[0]) - zero_offset
+    # Crown deviations — three modes:
+    #   plane:      signed distance to 3-foot local plane (comparator simulation)
+    #   deviation:  deviation-map residual per vertex (global curvature removed)
+    #   local-poly: residual from polynomial fit to the nominal ring outside the
+    #               crown; excludes pull-in points from the fit so the reference
+    #               surface is the true nominal, not a biased average.
+    if measure_mode == "deviation" and deviation_arr is not None:
+        dists = deviation_arr[crown_idx] - zero_offset
+
+    elif measure_mode == "local-poly":
+        cx, cy = rivet_center[0], rivet_center[1]
+        r_out  = hole_radius + r_outer_mm
+
+        # Collect candidate points for the nominal fit ring
+        fit_cand = np.array(
+            kdtree.query_ball_point(rivet_center, local_poly_fit_radius),
+            dtype=np.int32,
+        )
+        fit_d2d = np.linalg.norm(pts[fit_cand, :2] - rivet_center[:2], axis=1)
+        # Keep only the nominal zone: outside crown + 1 mm margin
+        fit_ok = fit_d2d >= r_out + 1.0
+        fit_idx = fit_cand[fit_ok]
+
+        # Exclude points inside other rivet holes from the fit
+        if other_hole_centers is not None:
+            for hc, hr in zip(other_hole_centers, other_hole_radii):
+                d_h = np.linalg.norm(pts[fit_idx, :2] - np.asarray(hc[:2]), axis=1)
+                fit_idx = fit_idx[d_h > hr]
+
+        min_pts = (local_poly_degree + 1) * (local_poly_degree + 2) // 2
+        if len(fit_idx) >= min_pts * 3:
+            xf = pts[fit_idx, 0] - cx
+            yf = pts[fit_idx, 1] - cy
+            zf = pts[fit_idx, 2]
+            A_fit   = _poly2d_basis(xf, yf, local_poly_degree)
+            coeffs, _, _, _ = np.linalg.lstsq(A_fit, zf, rcond=None)
+
+            xc = crown_pts[:, 0] - cx
+            yc = crown_pts[:, 1] - cy
+            z_ref = _poly2d_basis(xc, yc, local_poly_degree) @ coeffs
+            # zero_offset not applied: the polynomial already defines the nominal
+            # surface; any systematic residual in the fit region is absorbed.
+            dists = crown_pts[:, 2] - z_ref
+        else:
+            # Not enough nominal points — fall back to plane mode
+            dists = signed_distances(crown_pts, plane_n, foot_pts[0]) - zero_offset
+
+    else:
+        dists = signed_distances(crown_pts, plane_n, foot_pts[0]) - zero_offset
 
     # Angular sector index for each crown point
     dx = crown_pts[:, 0] - rivet_center[0]
@@ -474,6 +568,17 @@ def measure_crown_v1(rivet_center, hole_radius, pts, kdtree,
     s_counts = np.array([int((sector_ids == s).sum()) for s in range(n_sectors)])
     populated = ~np.isnan(s_means)
 
+    # Curvature quality flag (plane mode): if the deviation map range across
+    # the crown is large, the 3-foot plane is likely biased by local surface
+    # tilt — the measurement may be unreliable.
+    if deviation_arr is not None and measure_mode == "plane":
+        dev_crown = deviation_arr[crown_idx]
+        crown_dev_range = float(np.nanmax(dev_crown) - np.nanmin(dev_crown))
+        crown_dev_std   = float(np.nanstd(dev_crown))
+    else:
+        crown_dev_range = float("nan")
+        crown_dev_std   = float("nan")
+
     return {
         "center":            rivet_center,
         "hole_r":            float(hole_radius),
@@ -496,6 +601,8 @@ def measure_crown_v1(rivet_center, hole_radius, pts, kdtree,
         "coherent_mean":     coherent_mean,
         "sector_grid":       grid.tolist(),
         "zero_offset":       float(zero_offset),
+        "crown_dev_range":   round(crown_dev_range, 4),
+        "crown_dev_std":     round(crown_dev_std, 4),
     }
 
 
@@ -887,6 +994,7 @@ def main():
             from_edge_min=args.zero_from_edge_min,
             from_edge_max=args.zero_from_edge_max,
             feet_radius=args.feet_radius,
+            crown_buffer=args.r_outer,
             other_centers=other_c,
             other_radii=other_r,
             mastic_centers=mastic_centers,
@@ -897,8 +1005,12 @@ def main():
             zero_offset = 0.0
             no_zero    += 1
         else:
-            zo = zero_reading_at(zero_pt, pts, kdtree,
-                                 args.feet_radius, args.zero_probe_radius)
+            if args.measure_mode == "deviation":
+                zo = deviation_zero_reading(zero_pt, pts, kdtree,
+                                            deviation, args.zero_probe_radius)
+            else:
+                zo = zero_reading_at(zero_pt, pts, kdtree,
+                                     args.feet_radius, args.zero_probe_radius)
             zero_offset = zo if zo is not None else 0.0
 
         # --- Crown measurement ---
@@ -917,6 +1029,10 @@ def main():
             other_hole_radii=other_r,
             mastic_centers=mastic_centers,
             mastic_radii=mastic_radii,
+            deviation_arr=deviation,
+            measure_mode=args.measure_mode,
+            local_poly_fit_radius=args.local_poly_fit_radius,
+            local_poly_degree=args.local_poly_degree,
         )
         if res is None:
             skipped += 1

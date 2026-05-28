@@ -73,6 +73,15 @@ def parse_args():
     p.add_argument("--warn-hi", type=float, default=0.21,
                    help="Red start |pull-in| (mm)")
 
+    # Measurement mode
+    p.add_argument("--measure-mode", choices=["plane", "deviation", "local-poly"],
+                   default="plane",
+                   help="plane: 3-foot local plane (default). "
+                        "deviation: deviation-map residual. "
+                        "local-poly: polynomial fit to nominal ring outside crown.")
+    p.add_argument("--local-poly-fit-radius", type=float, default=30.0)
+    p.add_argument("--local-poly-degree",     type=int,   default=2)
+
     # Output
     p.add_argument("--workers",  type=int,  default=4)
     p.add_argument("--interactive", action=argparse.BooleanOptionalAction, default=False)
@@ -88,9 +97,9 @@ def process_one(ply_path, out_dir, args_dict):
 
     from virtual_comparator import find_holes, build_mastic_boundary_tree
     from virtual_comparator_v1 import (
-        find_zero_point, zero_reading_at,
+        find_zero_point, zero_reading_at, deviation_zero_reading,
         measure_crown_v1, make_static_plot, make_interactive_plot, save_csv,
-        auto_r_outer,
+        make_zero_plot, auto_r_outer,
     )
     from deviation_map import compute_deviation
 
@@ -140,6 +149,7 @@ def process_one(ply_path, out_dir, args_dict):
             from_edge_min=a["zero_from_edge_min"],
             from_edge_max=a["zero_from_edge_max"],
             feet_radius=a["feet_radius"],
+            crown_buffer=a["r_outer"],
             other_centers=other_c, other_radii=other_r,
             mastic_centers=mastic_centers, mastic_radii=mastic_radii,
             mastic_bound_tree=mastic_bound_tree, mastic_bound_r=mastic_bound_r,
@@ -147,8 +157,12 @@ def process_one(ply_path, out_dir, args_dict):
         if zero_pt is None:
             zero_offset = 0.0
         else:
-            zo = zero_reading_at(zero_pt, pts, kdtree,
-                                 a["feet_radius"], a["zero_probe_radius"])
+            if a["measure_mode"] == "deviation":
+                zo = deviation_zero_reading(zero_pt, pts, kdtree,
+                                            deviation, a["zero_probe_radius"])
+            else:
+                zo = zero_reading_at(zero_pt, pts, kdtree,
+                                     a["feet_radius"], a["zero_probe_radius"])
             zero_offset = zo if zo is not None else 0.0
 
         res = measure_crown_v1(
@@ -169,6 +183,10 @@ def process_one(ply_path, out_dir, args_dict):
             mastic_bound_tree=mastic_bound_tree,
             mastic_bound_r=mastic_bound_r,
             min_sector_coverage=a["min_sector_coverage"],
+            deviation_arr=deviation,
+            measure_mode=a["measure_mode"],
+            local_poly_fit_radius=a["local_poly_fit_radius"],
+            local_poly_degree=a["local_poly_degree"],
         )
         if res is None:
             continue
@@ -190,6 +208,11 @@ def process_one(ply_path, out_dir, args_dict):
         out_png = os.path.join(out_dir, f"{label}_comparator_v1.png")
         make_static_plot(pts, holes, mastics, results,
                          a["threshold"], label, out_png, plot_args)
+
+        zero_dir = os.path.join(out_dir, "zero_points")
+        os.makedirs(zero_dir, exist_ok=True)
+        out_zero = os.path.join(zero_dir, f"{label}_zero_points.png")
+        make_zero_plot(pts, mastics, results, label, out_zero, plot_args)
 
     if a["interactive"]:
         out_html = os.path.join(out_dir, f"{label}_comparator_v1.html")
