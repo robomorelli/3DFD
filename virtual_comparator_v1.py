@@ -133,6 +133,14 @@ def parse_args():
                    help="[local-poly] radius (mm) of the local fitting region around the rivet")
     p.add_argument("--local-poly-degree", type=int, default=2,
                    help="[local-poly] degree of the 2-D polynomial fit (default 2 = quadratic)")
+    p.add_argument("--local-poly-method", choices=["exclude", "robust"], default="exclude",
+                   help="[local-poly] exclude: fit only outside crown+1mm (needs r_outer). "
+                        "robust: fit all points in patch, iteratively reject negative outliers "
+                        "(pull-in) — no r_outer dependency.")
+    p.add_argument("--max-crown-dev-range", type=float, default=None,
+                   help="[plane] skip rivets whose crown deviation-map range exceeds this "
+                        "value (mm). Filters measurements biased by local surface curvature. "
+                        "Suggested: 0.15 mm. Default: disabled.")
 
     # Output
     p.add_argument("--interactive", action=argparse.BooleanOptionalAction, default=True,
@@ -365,7 +373,7 @@ def deviation_zero_reading(zero_center, pts, kdtree, deviation, probe_radius):
     return float(np.median(deviation[idxs]))
 
 
-# ── Local polynomial helper ───────────────────────────────────────────────────
+# ── Local polynomial helpers ──────────────────────────────────────────────────
 def _poly2d_basis(x, y, degree):
     """Vandermonde matrix for a 2-D polynomial up to `degree`."""
     cols = []
@@ -373,6 +381,34 @@ def _poly2d_basis(x, y, degree):
         for i in range(d + 1):
             cols.append(x ** (d - i) * y ** i)
     return np.column_stack(cols)
+
+
+def _robust_poly_fit(x, y, z, degree, n_iter=4, reject_sigma=1.5):
+    """
+    Iterative negative-outlier rejection for 2-D polynomial fit.
+
+    Pull-in depressions are strong NEGATIVE residuals.  Each iteration:
+      1. Fit OLS on current inlier set.
+      2. Compute residuals; estimate scatter from the positive half (robust σ).
+      3. Reject points with residual < -reject_sigma * σ.
+    Returns coefficients of the final fit on the cleaned inlier set.
+    """
+    A = _poly2d_basis(x, y, degree)
+    keep = np.ones(len(z), dtype=bool)
+    min_pts = A.shape[1] * 2
+    for _ in range(n_iter):
+        Ak, zk = A[keep], z[keep]
+        coeffs, _, _, _ = np.linalg.lstsq(Ak, zk, rcond=None)
+        resid = z - A @ coeffs
+        # Estimate σ from positive residuals only (unaffected by pull-in)
+        pos = resid[resid > 0]
+        sigma = float(pos.std()) if len(pos) > 3 else float(np.std(resid))
+        new_keep = resid > -reject_sigma * sigma
+        if new_keep.sum() < min_pts or np.array_equal(new_keep, keep):
+            break
+        keep = new_keep
+    coeffs, _, _, _ = np.linalg.lstsq(A[keep], z[keep], rcond=None)
+    return coeffs
 
 
 # ── Crown measurement with sector analysis ────────────────────────────────────
@@ -386,7 +422,8 @@ def measure_crown_v1(rivet_center, hole_radius, pts, kdtree,
                      mastic_bound_tree=None, mastic_bound_r=3.0,
                      min_sector_coverage=0.3,
                      deviation_arr=None, measure_mode="plane",
-                     local_poly_fit_radius=30.0, local_poly_degree=2):
+                     local_poly_fit_radius=30.0, local_poly_degree=2,
+                     local_poly_method="exclude"):
     """
     Measure the annular crown [hole_r+r_inner, hole_r+r_outer] around a rivet.
 
@@ -466,40 +503,51 @@ def measure_crown_v1(rivet_center, hole_radius, pts, kdtree,
 
     elif measure_mode == "local-poly":
         cx, cy = rivet_center[0], rivet_center[1]
-        r_out  = hole_radius + r_outer_mm
 
-        # Collect candidate points for the nominal fit ring
+        # Collect all points within the local fitting radius
         fit_cand = np.array(
             kdtree.query_ball_point(rivet_center, local_poly_fit_radius),
             dtype=np.int32,
         )
         fit_d2d = np.linalg.norm(pts[fit_cand, :2] - rivet_center[:2], axis=1)
-        # Keep only the nominal zone: outside crown + 1 mm margin
-        fit_ok = fit_d2d >= r_out + 1.0
-        fit_idx = fit_cand[fit_ok]
 
-        # Exclude points inside other rivet holes from the fit
-        if other_hole_centers is not None:
-            for hc, hr in zip(other_hole_centers, other_hole_radii):
-                d_h = np.linalg.norm(pts[fit_idx, :2] - np.asarray(hc[:2]), axis=1)
-                fit_idx = fit_idx[d_h > hr]
+        if local_poly_method == "exclude":
+            # Keep only the nominal zone: outside own crown + 1 mm margin.
+            # Also exclude neighbouring rivets' crown zones (not just their holes)
+            # to avoid the nominal ring being contaminated by adjacent pull-ins.
+            r_out  = hole_radius + r_outer_mm
+            fit_ok = fit_d2d >= r_out + 1.0
+            fit_idx = fit_cand[fit_ok]
+            if other_hole_centers is not None:
+                for hc, hr in zip(other_hole_centers, other_hole_radii):
+                    d_h = np.linalg.norm(pts[fit_idx, :2] - np.asarray(hc[:2]), axis=1)
+                    fit_idx = fit_idx[d_h > hr]
+        else:  # "robust" — use all points, iteratively reject negative outliers
+            fit_ok = fit_d2d >= hole_radius
+            fit_idx = fit_cand[fit_ok]
+            if other_hole_centers is not None:
+                for hc, hr in zip(other_hole_centers, other_hole_radii):
+                    d_h = np.linalg.norm(pts[fit_idx, :2] - np.asarray(hc[:2]), axis=1)
+                    fit_idx = fit_idx[d_h > hr]   # robust handles pull-in by itself
 
         min_pts = (local_poly_degree + 1) * (local_poly_degree + 2) // 2
         if len(fit_idx) >= min_pts * 3:
             xf = pts[fit_idx, 0] - cx
             yf = pts[fit_idx, 1] - cy
             zf = pts[fit_idx, 2]
-            A_fit   = _poly2d_basis(xf, yf, local_poly_degree)
-            coeffs, _, _, _ = np.linalg.lstsq(A_fit, zf, rcond=None)
+
+            if local_poly_method == "robust":
+                coeffs = _robust_poly_fit(xf, yf, zf, local_poly_degree)
+            else:
+                coeffs, _, _, _ = np.linalg.lstsq(
+                    _poly2d_basis(xf, yf, local_poly_degree), zf, rcond=None)
 
             xc = crown_pts[:, 0] - cx
             yc = crown_pts[:, 1] - cy
             z_ref = _poly2d_basis(xc, yc, local_poly_degree) @ coeffs
-            # zero_offset not applied: the polynomial already defines the nominal
-            # surface; any systematic residual in the fit region is absorbed.
             dists = crown_pts[:, 2] - z_ref
         else:
-            # Not enough nominal points — fall back to plane mode
+            # Not enough fit points — fall back to plane mode
             dists = signed_distances(crown_pts, plane_n, foot_pts[0]) - zero_offset
 
     else:
@@ -1033,8 +1081,17 @@ def main():
             measure_mode=args.measure_mode,
             local_poly_fit_radius=args.local_poly_fit_radius,
             local_poly_degree=args.local_poly_degree,
+            local_poly_method=args.local_poly_method,
         )
         if res is None:
+            skipped += 1
+            continue
+
+        # Filter: skip measurements where surface curvature in the crown
+        # is too large for the plane comparator to be reliable.
+        if (args.max_crown_dev_range is not None
+                and np.isfinite(res["crown_dev_range"])
+                and res["crown_dev_range"] > args.max_crown_dev_range):
             skipped += 1
             continue
 

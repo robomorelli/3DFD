@@ -76,11 +76,14 @@ def parse_args():
     # Measurement mode
     p.add_argument("--measure-mode", choices=["plane", "deviation", "local-poly"],
                    default="plane",
-                   help="plane: 3-foot local plane (default). "
+                   help="plane: 3-foot local plane (default). " 
                         "deviation: deviation-map residual. "
                         "local-poly: polynomial fit to nominal ring outside crown.")
     p.add_argument("--local-poly-fit-radius", type=float, default=30.0)
     p.add_argument("--local-poly-degree",     type=int,   default=2)
+    p.add_argument("--local-poly-method",     choices=["exclude", "robust"], default="exclude")
+    p.add_argument("--max-crown-dev-range",   type=float, default=None,
+                   help="[plane] skip rivets with crown deviation range > this (mm)")
 
     # Output
     p.add_argument("--workers",  type=int,  default=4)
@@ -187,8 +190,16 @@ def process_one(ply_path, out_dir, args_dict):
             measure_mode=a["measure_mode"],
             local_poly_fit_radius=a["local_poly_fit_radius"],
             local_poly_degree=a["local_poly_degree"],
+            local_poly_method=a["local_poly_method"],
         )
         if res is None:
+            continue
+
+        import math
+        max_dr = a.get("max_crown_dev_range")
+        if (max_dr is not None
+                and math.isfinite(res.get("crown_dev_range", float("nan")))
+                and res["crown_dev_range"] > max_dr):
             continue
 
         res["hole_idx"]    = i
