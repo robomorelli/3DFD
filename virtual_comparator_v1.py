@@ -107,11 +107,13 @@ def parse_args():
     p.add_argument("--threshold", type=float, default=-0.2,
                    help="Defect threshold on k_worst_mean (mm). Values below are flagged.")
 
-    # Orange (warning) zone
+    # Colour zones
     p.add_argument("--warn-lo", type=float, default=0.14,
                    help="Orange zone start |pull-in| (mm) — below this is green")
     p.add_argument("--warn-hi", type=float, default=0.21,
                    help="Red start |pull-in| (mm) — above this is red, below is orange")
+    p.add_argument("--critical-hi", type=float, default=0.60,
+                   help="Black (critical) start |pull-in| (mm) — above this is black")
 
     # Foot validity
     p.add_argument("--foot-dist-max", type=float, default=3.0,
@@ -267,10 +269,11 @@ def auto_r_outer(holes):
 # ── Auto-zero point search ────────────────────────────────────────────────────
 def find_zero_point(rivet_center, hole_radius, pts, kdtree, deviation,
                     nominal_thresh=0.10, from_edge_min=13.0, from_edge_max=60.0,
-                    feet_radius=13.7, crown_buffer=0.0,
+                    feet_radius=13.7,
                     other_centers=None, other_radii=None,
                     mastic_centers=None, mastic_radii=None,
-                    mastic_bound_tree=None, mastic_bound_r=3.0):
+                    mastic_bound_tree=None, mastic_bound_r=3.0,
+                    zero_search="free", crown_buffer=0.0):
     """
     Find the nearest nominal (yellow, near-zero) vertex for zeroing.
 
@@ -283,10 +286,6 @@ def find_zero_point(rivet_center, hole_radius, pts, kdtree, deviation,
          Among those, take the nearest.
       2. If no nominal candidate exists, take the one with the highest
          deviation (least red) among all non-excluded candidates.
-
-    crown_buffer: extra exclusion radius added to each neighbouring rivet's
-    hole radius.  Set to r_outer so that the zero point cannot fall inside
-    any rivet's deformation zone — avoids zeroing towards rivet rows.
 
     Excludes zones covered by other rivet holes or mastic.
 
@@ -305,17 +304,18 @@ def find_zero_point(rivet_center, hole_radius, pts, kdtree, deviation,
     if len(idxs) == 0:
         return None
 
-    # Exclude neighbouring rivet holes + their deformation zone (crown_buffer).
-    # This prevents the zero point falling inside another rivet's pull-in region,
-    # which would cause the zero to be biased toward that rivet's depression.
+    # Exclude neighbouring rivet holes (and optionally their crown zone).
+    # free:    exclude only the hole body     → d > hole_r + probe_r
+    # bounded: also exclude the crown zone   → d > hole_r + crown_buffer + probe_r
     probe_r = 4.0   # default probe disc radius
     if other_centers is not None and len(other_centers) > 0:
         keep = np.ones(len(idxs), dtype=bool)
+        extra = crown_buffer if zero_search == "bounded" else 0.0
         for oc, or_ in zip(other_centers, other_radii):
             if np.linalg.norm(np.asarray(oc[:2]) - rivet_center[:2]) < 1e-3:
                 continue
             d_oc = np.linalg.norm(pts[idxs, :2] - np.asarray(oc[:2]), axis=1)
-            keep &= d_oc > (or_ + probe_r + crown_buffer)
+            keep &= d_oc > (or_ + extra + probe_r)
         idxs, d2d = idxs[keep], d2d[keep]
 
     # Mastic exclusion is stricter: avoid comparator landing on mastic material
@@ -656,11 +656,14 @@ def measure_crown_v1(rivet_center, hole_radius, pts, kdtree,
 
 # ── Rivet colour helper ───────────────────────────────────────────────────────
 def _rivet_col(r, args):
-    """3-zone colour: limegreen / darkorange / red."""
+    """4-zone colour: limegreen / darkorange / red / black (critical)."""
     v = r["k_worst_mean"]
     if not r.get("foot_ok", True) or not np.isfinite(v):
         return "gray"
-    if v <= -args.warn_hi:
+    critical = getattr(args, "critical_hi", 0.60)
+    if v <= -critical:
+        return "black"
+    elif v <= -args.warn_hi:
         return "red"
     elif v <= -args.warn_lo:
         return "darkorange"
@@ -730,10 +733,12 @@ def make_static_plot(pts, holes, mastics, results, threshold, label, out_path, a
         ax.scatter(mv[:, 0], mv[:, 1], s=1, c="orange",
                    alpha=0.5, linewidths=0, zorder=3)
 
+    critical = getattr(args, "critical_hi", 0.60)
     legend_elems = [
         mpatches.Patch(color="limegreen",  label=f"OK  (>{-args.warn_lo:.2f} mm)"),
         mpatches.Patch(color="darkorange", label=f"Warn  [{-args.warn_hi:.2f}..{-args.warn_lo:.2f}] mm"),
-        mpatches.Patch(color="red",        label=f"Difetto  (<{-args.warn_hi:.2f} mm)"),
+        mpatches.Patch(color="red",        label=f"Difetto  [{-critical:.2f}..{-args.warn_hi:.2f}] mm"),
+        mpatches.Patch(color="black",      label=f"Critico  (<{-critical:.2f} mm)"),
         mpatches.Patch(color="gray",       label="piedi fuori pannello"),
     ]
     ax.legend(handles=legend_elems, fontsize=7, loc="upper right")
@@ -804,6 +809,7 @@ def make_zero_plot(pts, mastics, results, label, out_path, args):
         mpatches.Patch(color="limegreen",  label="OK"),
         mpatches.Patch(color="darkorange", label="Warn"),
         mpatches.Patch(color="red",        label="Difetto"),
+        mpatches.Patch(color="black",      label="Critico"),
     ]
     ax.legend(handles=legend_elems, fontsize=7, loc="upper right")
     ax.set_aspect("equal")
@@ -1042,7 +1048,6 @@ def main():
             from_edge_min=args.zero_from_edge_min,
             from_edge_max=args.zero_from_edge_max,
             feet_radius=args.feet_radius,
-            crown_buffer=args.r_outer,
             other_centers=other_c,
             other_radii=other_r,
             mastic_centers=mastic_centers,

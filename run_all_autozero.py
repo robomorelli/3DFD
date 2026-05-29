@@ -57,6 +57,9 @@ def parse_args():
     p.add_argument("--zero-nominal-thresh",  type=float, default=0.10)
     p.add_argument("--zero-from-edge-min",   type=float, default=13.0)
     p.add_argument("--zero-from-edge-max",   type=float, default=60.0)
+    p.add_argument("--zero-search", choices=["free", "bounded"], default="free",
+                   help="free: exclude only hole body of neighbours (default). "
+                        "bounded: also exclude their crown zone (may reduce candidate count).")
     p.add_argument("--green-thresh",         type=float, default=0.05)
 
     # Deviation map
@@ -67,11 +70,13 @@ def parse_args():
     # Detection threshold (kept for CSV defect column)
     p.add_argument("--threshold", type=float, default=-0.2)
 
-    # Orange warning zone
-    p.add_argument("--warn-lo", type=float, default=0.14,
+    # Colour zones
+    p.add_argument("--warn-lo",     type=float, default=0.14,
                    help="Orange zone start |pull-in| (mm)")
-    p.add_argument("--warn-hi", type=float, default=0.21,
+    p.add_argument("--warn-hi",     type=float, default=0.21,
                    help="Red start |pull-in| (mm)")
+    p.add_argument("--critical-hi", type=float, default=0.60,
+                   help="Black (critical) start |pull-in| (mm)")
 
     # Measurement mode
     p.add_argument("--measure-mode", choices=["plane", "deviation", "local-poly"],
@@ -152,10 +157,11 @@ def process_one(ply_path, out_dir, args_dict):
             from_edge_min=a["zero_from_edge_min"],
             from_edge_max=a["zero_from_edge_max"],
             feet_radius=a["feet_radius"],
-            crown_buffer=a["r_outer"],
             other_centers=other_c, other_radii=other_r,
             mastic_centers=mastic_centers, mastic_radii=mastic_radii,
             mastic_bound_tree=mastic_bound_tree, mastic_bound_r=mastic_bound_r,
+            zero_search=a["zero_search"],
+            crown_buffer=a["r_outer"],
         )
         if zero_pt is None:
             zero_offset = 0.0
@@ -268,23 +274,22 @@ def process_one(ply_path, out_dir, args_dict):
     }
 
 
-def summary_plot(summary_rows, threshold, warn_lo, warn_hi, out_path):
+def summary_plot(summary_rows, threshold, warn_lo, warn_hi, out_path, critical_hi=0.60):
     rows   = sorted(summary_rows, key=lambda r: r["label"])
     labels = [r["label"] for r in rows]
     worst  = [r["worst_dev"] if r["worst_dev"] is not None else 0.0 for r in rows]
 
     def bar_col(w):
-        if w <= -warn_hi:
-            return "red"
-        if w <= -warn_lo:
-            return "darkorange"
+        if w <= -critical_hi:  return "black"
+        if w <= -warn_hi:      return "red"
+        if w <= -warn_lo:      return "darkorange"
         return "steelblue"
 
     x   = np.arange(len(labels))
     fig, axes = plt.subplots(2, 1, figsize=(max(14, len(labels) * 0.45), 10))
     fig.suptitle(
         f"Virtual Comparator v1 (auto-zero) — All surfaces summary\n"
-        f"orange [{-warn_hi:.2f},{-warn_lo:.2f}]  ·  red <{-warn_hi:.2f} mm",
+        f"orange [{-warn_hi:.2f},{-warn_lo:.2f}]  ·  red [{-critical_hi:.2f},{-warn_hi:.2f}]  ·  black <{-critical_hi:.2f} mm",
         fontsize=13, fontweight="bold",
     )
 
@@ -300,10 +305,12 @@ def summary_plot(summary_rows, threshold, warn_lo, warn_hi, out_path):
 
     ax2 = axes[1]
     ax2.bar(x, worst, color=[bar_col(w) for w in worst], alpha=0.85)
-    ax2.axhline(-warn_hi, color="red",        ls="-",  lw=1.5,
-                label=f"alarm  {-warn_hi:.2f} mm")
-    ax2.axhline(-warn_lo, color="darkorange", ls="-",  lw=1.2,
-                label=f"warn   {-warn_lo:.2f} mm")
+    ax2.axhline(-critical_hi, color="black",     ls="-",  lw=1.5,
+                label=f"critical  {-critical_hi:.2f} mm")
+    ax2.axhline(-warn_hi,     color="red",        ls="-",  lw=1.5,
+                label=f"alarm     {-warn_hi:.2f} mm")
+    ax2.axhline(-warn_lo,     color="darkorange", ls="-",  lw=1.2,
+                label=f"warn      {-warn_lo:.2f} mm")
     ax2.set_xticks(x)
     ax2.set_xticklabels(labels, rotation=60, ha="right", fontsize=7)
     ax2.set_ylabel("worst k_worst_mean (mm)")
@@ -362,7 +369,8 @@ def main():
     if args.plots:
         plot_path = os.path.join(args.out_dir, "summary.png")
         summary_plot(summary_rows, args.threshold,
-                     args.warn_lo, args.warn_hi, plot_path)
+                     args.warn_lo, args.warn_hi, plot_path,
+                     critical_hi=args.critical_hi)
         print(f"Plot → {plot_path}")
 
     total_holes   = sum(r["n_holes"]   for r in summary_rows)
