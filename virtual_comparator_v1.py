@@ -124,13 +124,13 @@ def parse_args():
                    help="Minimum feet radius tried when full radius puts feet off-panel (mm)")
 
     # Measurement mode
-    p.add_argument("--measure-mode", choices=["plane", "deviation", "local-poly"],
+    p.add_argument("--measure-mode", choices=["plane", "deviation", "local-poly", "per-point"],
                    default="plane",
                    help="plane: signed distance to 3-foot local plane (default). "
                         "deviation: deviation-map residual (global curvature removed). "
-                        "local-poly: polynomial fit to the nominal ring outside the crown — "
-                        "avoids the curved-surface bias of the plane approach without "
-                        "relying on a global panel fit.")
+                        "local-poly: polynomial fit to the nominal ring outside the crown. "
+                        "per-point: one comparator placement per crown point — feet land "
+                        "around that point, new plane for each, then subtract zero offset.")
     p.add_argument("--local-poly-fit-radius", type=float, default=30.0,
                    help="[local-poly] radius (mm) of the local fitting region around the rivet")
     p.add_argument("--local-poly-degree", type=int, default=2,
@@ -498,7 +498,32 @@ def measure_crown_v1(rivet_center, hole_radius, pts, kdtree,
     #   local-poly: residual from polynomial fit to the nominal ring outside the
     #               crown; excludes pull-in points from the fit so the reference
     #               surface is the true nominal, not a biased average.
-    if measure_mode == "deviation" and deviation_arr is not None:
+    if measure_mode == "per-point":
+        # For each crown point: place the comparator centred on that point,
+        # let the feet land on the mesh, build a local plane, measure the
+        # signed distance of the probe (the crown point itself) to that plane,
+        # then subtract zero_offset.
+        all_hc = list(other_hole_centers or []) + [rivet_center]
+        all_hr = list(other_hole_radii   or []) + [hole_radius]
+        raw = np.full(len(crown_pts), np.nan)
+        for k, cp in enumerate(crown_pts):
+            pn, fp, _, _, fok = find_valid_plane(
+                cp, pts, kdtree, feet_radius, foot_dist_max, feet_radius_min,
+                hole_centers=all_hc, hole_radii=all_hr,
+                mastic_centers=mastic_centers, mastic_radii=mastic_radii,
+                mastic_bound_tree=mastic_bound_tree, mastic_bound_r=mastic_bound_r,
+            )
+            if pn is not None and fok:
+                raw[k] = float((cp - fp[0]) @ pn)
+        valid = np.isfinite(raw)
+        crown_idx  = crown_idx[valid]
+        crown_pts  = crown_pts[valid]
+        d2d_crown  = d2d_crown[valid]
+        dists      = raw[valid] - zero_offset
+        if len(crown_pts) < max(n_sectors * n_radial_bands, 5):
+            return None
+
+    elif measure_mode == "deviation" and deviation_arr is not None:
         dists = deviation_arr[crown_idx] - zero_offset
 
     elif measure_mode == "local-poly":
@@ -657,7 +682,7 @@ def measure_crown_v1(rivet_center, hole_radius, pts, kdtree,
 # ── Rivet colour helper ───────────────────────────────────────────────────────
 def _rivet_col(r, args):
     """4-zone colour: limegreen / darkorange / red / black (critical)."""
-    v = r["k_worst_mean"]
+    v = round(r["k_worst_mean"], 2)   # match label precision (:.2f) so colour = what label shows
     if not r.get("foot_ok", True) or not np.isfinite(v):
         return "gray"
     critical = getattr(args, "critical_hi", 0.60)
@@ -727,6 +752,9 @@ def make_static_plot(pts, holes, mastics, results, threshold, label, out_path, a
             zc = r["zero_center"]
             ax.plot(zc[0], zc[1], marker="+", ms=5, color="cyan",
                     lw=0, markeredgewidth=1.2, zorder=6)
+            ax.plot([c[0], zc[0]], [c[1], zc[1]],
+                    color="cyan", linewidth=0.5, linestyle="--",
+                    alpha=0.6, zorder=5)
 
     for m in mastics:
         mv = pts[m["verts"]]

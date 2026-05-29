@@ -55,11 +55,18 @@ def parse_args():
 
     # Auto-zero
     p.add_argument("--zero-nominal-thresh",  type=float, default=0.10)
-    p.add_argument("--zero-from-edge-min",   type=float, default=13.0)
-    p.add_argument("--zero-from-edge-max",   type=float, default=60.0)
+    p.add_argument("--zero-from-edge-min",   type=float, default=60.0)
+    p.add_argument("--zero-from-edge-max",   type=float, default=100.0)
     p.add_argument("--zero-search", choices=["free", "bounded"], default="free",
                    help="free: exclude only hole body of neighbours (default). "
                         "bounded: also exclude their crown zone (may reduce candidate count).")
+    p.add_argument("--double-row-nn-thresh", type=float, default=40.0,
+                   help="Centre-to-centre distance (mm) below which a rivet is considered "
+                        "to be in a double row. Set to 0 to disable. (default: 40)")
+    p.add_argument("--double-row-edge-min",  type=float, default=13.0,
+                   help="zero-from-edge-min (mm) used for double-row rivets (default: 13)")
+    p.add_argument("--double-row-edge-max",  type=float, default=150.0,
+                   help="zero-from-edge-max (mm) used for double-row rivets (default: 150)")
     p.add_argument("--green-thresh",         type=float, default=0.05)
 
     # Deviation map
@@ -71,15 +78,15 @@ def parse_args():
     p.add_argument("--threshold", type=float, default=-0.2)
 
     # Colour zones
-    p.add_argument("--warn-lo",     type=float, default=0.14,
+    p.add_argument("--warn-lo",     type=float, default=0.13,
                    help="Orange zone start |pull-in| (mm)")
-    p.add_argument("--warn-hi",     type=float, default=0.21,
+    p.add_argument("--warn-hi",     type=float, default=0.20,
                    help="Red start |pull-in| (mm)")
     p.add_argument("--critical-hi", type=float, default=0.60,
                    help="Black (critical) start |pull-in| (mm)")
 
     # Measurement mode
-    p.add_argument("--measure-mode", choices=["plane", "deviation", "local-poly"],
+    p.add_argument("--measure-mode", choices=["plane", "deviation", "local-poly", "per-point"],
                    default="plane",
                    help="plane: 3-foot local plane (default). " 
                         "deviation: deviation-map residual. "
@@ -142,27 +149,88 @@ def process_one(ply_path, out_dir, args_dict):
                       for m in mastics if m["radius_mm"] < MASTIC_R_MAX]
     mastic_bound_tree, mastic_bound_r = build_mastic_boundary_tree(mastics, pts, buffer_r=3.0)
 
-    results = []
+    # Precompute nearest-neighbour distance and index for each hole.
+    centers_xy = np.array([h["center"][:2] for h in holes])
+    if len(holes) > 1 and a["double_row_nn_thresh"] > 0:
+        from scipy.spatial import cKDTree as _KDT
+        _htree = _KDT(centers_xy)
+        _nn_out = _htree.query(centers_xy, k=2)
+        nn_dists = _nn_out[0][:, 1]
+        nn_idxs  = _nn_out[1][:, 1]
+    else:
+        nn_dists = np.full(len(holes), np.inf)
+        nn_idxs  = np.arange(len(holes))
+
+    # ── Pass 1: compute zero_pt for every rivet ───────────────────────────────
+    zero_pts_all = []
     for i, hole in enumerate(holes):
         c = hole["center"].copy()
         r = hole["radius_mm"]
-
         other_c = [all_centers[j] for j in range(len(holes)) if j != i]
         other_r = [all_radii[j]   for j in range(len(holes)) if j != i]
 
-        # Auto-zero (always enabled in this script)
-        zero_pt = find_zero_point(
+        if nn_dists[i] < a["double_row_nn_thresh"]:
+            z_edge_min = a["double_row_edge_min"]
+            z_edge_max = a["double_row_edge_max"]
+            z_search   = "bounded"
+        else:
+            z_edge_min = a["zero_from_edge_min"]
+            z_edge_max = a["zero_from_edge_max"]
+            z_search   = a["zero_search"]
+
+        zero_pts_all.append(find_zero_point(
             c, r, pts, kdtree, deviation,
             nominal_thresh=a["zero_nominal_thresh"],
-            from_edge_min=a["zero_from_edge_min"],
-            from_edge_max=a["zero_from_edge_max"],
+            from_edge_min=z_edge_min, from_edge_max=z_edge_max,
             feet_radius=a["feet_radius"],
             other_centers=other_c, other_radii=other_r,
             mastic_centers=mastic_centers, mastic_radii=mastic_radii,
             mastic_bound_tree=mastic_bound_tree, mastic_bound_r=mastic_bound_r,
-            zero_search=a["zero_search"],
-            crown_buffer=a["r_outer"],
-        )
+            zero_search=z_search, crown_buffer=a["r_outer"],
+        ))
+
+    # ── Double-row zero sharing: inner rivet borrows outer's zero_pt ──────────
+    # For each pair (i, j) with nn_dist < thresh, determine which is "outer"
+    # (zero_pt is on the far side from the partner) and give its zero_pt to the
+    # inner rivet.
+    processed_pairs = set()
+    for i in range(len(holes)):
+        if nn_dists[i] >= a["double_row_nn_thresh"]:
+            continue
+        j = int(nn_idxs[i])
+        pair = (min(i, j), max(i, j))
+        if pair in processed_pairs:
+            continue
+        processed_pairs.add(pair)
+
+        zpi = zero_pts_all[i]
+        zpj = zero_pts_all[j]
+        ci  = centers_xy[i]
+        cj  = centers_xy[j]
+        dir_ij = cj - ci   # direction from i toward j
+
+        if zpi is not None and zpj is not None:
+            # dot > 0: zero_pt is in the same direction as the partner → inner side
+            # dot < 0: zero_pt is on the opposite side → outer side
+            dot_i = np.dot(zpi[:2] - ci, dir_ij)
+            if dot_i < 0:      # i is outer → j (inner) borrows i's zero_pt
+                zero_pts_all[j] = zpi
+            else:              # j is outer → i (inner) borrows j's zero_pt
+                zero_pts_all[i] = zpj
+        elif zpi is not None:  # only i has a zero → share with j
+            zero_pts_all[j] = zpi
+        elif zpj is not None:  # only j has a zero → share with i
+            zero_pts_all[i] = zpj
+
+    # ── Pass 2: measure each rivet using the finalised zero_pts ──────────────
+    results = []
+    for i, hole in enumerate(holes):
+        c = hole["center"].copy()
+        r = hole["radius_mm"]
+        other_c = [all_centers[j] for j in range(len(holes)) if j != i]
+        other_r = [all_radii[j]   for j in range(len(holes)) if j != i]
+
+        zero_pt = zero_pts_all[i]
         if zero_pt is None:
             zero_offset = 0.0
         else:
