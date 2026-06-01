@@ -77,11 +77,15 @@ def parse_args():
                    help="Radial subdivisions per sector (inner→outer).")
 
     # Zero method
-    p.add_argument("--zero-method", choices=["flatness", "deviation"], default="flatness",
+    p.add_argument("--zero-method", choices=["flatness", "deviation", "learned"],
+                   default="flatness",
                    help="flatness: pick zero at vertex with minimum local surface roughness "
                         "(mimics annotator torch inspection — finds flattest spot). "
                         "deviation: legacy v1 behaviour — pick vertex with minimum global "
-                        "deviation-map residual.")
+                        "deviation-map residual. "
+                        "learned: score candidates with a trained RF model (--zero-model).")
+    p.add_argument("--zero-model", default=None,
+                   help="[learned] path to the trained model (.pkl from train_zero_selector.py)")
     p.add_argument("--zero-flatness-radius", type=float, default=3.0,
                    help="[flatness] radius (mm) of the local neighbourhood used to compute "
                         "surface roughness at each zero candidate. Smaller = more local "
@@ -405,6 +409,66 @@ def find_zero_point_deviation(rivet_center, hole_radius, pts, kdtree, deviation,
     if np.abs(deviation[idxs[best]]) < nominal_thresh:
         return pts[idxs[best]].copy(), float(np.abs(deviation[idxs[best]]))
     return None, float("nan")
+
+
+def find_zero_point_learned(rivet_center, hole_radius, pts, kdtree,
+                             model,
+                             from_edge_min=13.0, from_edge_max=60.0,
+                             feet_radius=13.7,
+                             other_centers=None, other_radii=None,
+                             mastic_centers=None, mastic_radii=None,
+                             mastic_bound_tree=None, mastic_bound_r=3.0,
+                             zero_search="free", crown_buffer=0.0,
+                             R_feat=15.0,
+                             n_angular=16, n_radial=5):
+    """
+    Score candidate zero points with a trained Random Forest and return
+    the highest-scoring one.
+
+    model : sklearn Pipeline loaded with joblib from train_zero_selector.py
+    Returns (zero_point, score) or (None, 0.0).
+    """
+    from zero_point_features import (
+        generate_zero_candidates, extract_zero_candidate_features,
+        features_to_array,
+    )
+
+    candidates = generate_zero_candidates(
+        rivet_center, hole_radius, pts, kdtree,
+        from_edge_min=from_edge_min,
+        from_edge_max=from_edge_max,
+        n_angular=n_angular,
+        n_radial=n_radial,
+        other_centers=other_centers,
+        other_radii=other_radii,
+        mastic_centers=mastic_centers,
+        mastic_radii=mastic_radii,
+        feet_radius=feet_radius,
+    )
+    if len(candidates) == 0:
+        return None, 0.0
+
+    feat_rows = []
+    valid_cands = []
+    for p in candidates:
+        feat = extract_zero_candidate_features(
+            p, rivet_center, hole_radius, pts, kdtree,
+            other_centers, other_radii,
+            mastic_centers, mastic_radii,
+            R_feat=R_feat,
+        )
+        if feat is None:
+            continue
+        feat_rows.append(features_to_array(feat))
+        valid_cands.append(p)
+
+    if not feat_rows:
+        return None, 0.0
+
+    X      = np.array(feat_rows)
+    scores = model.predict_proba(X)[:, 1]   # P(oracle class)
+    best   = int(np.argmax(scores))
+    return valid_cands[best].copy(), float(scores[best])
 
 
 def zero_reading_at(zero_center, pts, kdtree, feet_radius, probe_radius,
@@ -1090,6 +1154,8 @@ def main():
           f"from edge [{args.zero_from_edge_min},{args.zero_from_edge_max}] mm")
     if args.zero_method == "flatness":
         print(f"           flatness_radius={args.zero_flatness_radius} mm")
+    elif args.zero_method == "learned":
+        print(f"           model={args.zero_model}")
     print(f"{'='*68}")
 
     # ── Load ──────────────────────────────────────────────────────────────────
@@ -1147,6 +1213,16 @@ def main():
     print(f"    Mastic zones for exclusion: {len(mastic_centers)}/{len(mastics)} "
           f"(radius < {MASTIC_R_MAX} mm)")
 
+    # ── Load learned model if needed ─────────────────────────────────────────
+    _learned_model = None
+    if args.zero_method == "learned":
+        import joblib
+        if not args.zero_model:
+            print("ERROR: --zero-method learned requires --zero-model <path>")
+            return
+        _learned_model = joblib.load(args.zero_model)
+        print(f"[4b] Learned zero model loaded from {args.zero_model}")
+
     # ── Measure each rivet ────────────────────────────────────────────────────
     print(f"\n[5] Measuring {len(holes)} rivets …")
     results, skipped, no_zero = [], 0, 0
@@ -1158,7 +1234,7 @@ def main():
         other_c = [all_centers[j] for j in range(len(holes)) if j != i]
         other_r = [all_radii[j]   for j in range(len(holes)) if j != i]
 
-        # --- Auto-zero (v2: local flatness or legacy deviation) ---
+        # --- Auto-zero (v2: flatness / deviation / learned) ---
         if args.zero_method == "flatness":
             zero_pt, zero_roughness = find_zero_point_flatness(
                 c, r, pts, kdtree,
@@ -1170,6 +1246,18 @@ def main():
                 mastic_centers=mastic_centers,
                 mastic_radii=mastic_radii,
                 flatness_radius=args.zero_flatness_radius,
+            )
+        elif args.zero_method == "learned":
+            zero_pt, zero_roughness = find_zero_point_learned(
+                c, r, pts, kdtree,
+                model=_learned_model,
+                from_edge_min=args.zero_from_edge_min,
+                from_edge_max=args.zero_from_edge_max,
+                feet_radius=args.feet_radius,
+                other_centers=other_c,
+                other_radii=other_r,
+                mastic_centers=mastic_centers,
+                mastic_radii=mastic_radii,
             )
         else:
             zero_pt, zero_roughness = find_zero_point_deviation(
