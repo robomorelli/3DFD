@@ -54,7 +54,7 @@ def parse_args():
                         "(0 = disabilitato, 1 = tutti i punti necessari).")
 
     # Auto-zero
-    p.add_argument("--zero-nominal-thresh",  type=float, default=0.10)
+    p.add_argument("--zero-nominal-thresh",  type=float, default=5.0)
     p.add_argument("--zero-from-edge-min",   type=float, default=60.0)
     p.add_argument("--zero-from-edge-max",   type=float, default=100.0)
     p.add_argument("--zero-search", choices=["free", "bounded"], default="free",
@@ -63,10 +63,10 @@ def parse_args():
     p.add_argument("--double-row-nn-thresh", type=float, default=40.0,
                    help="Centre-to-centre distance (mm) below which a rivet is considered "
                         "to be in a double row. Set to 0 to disable. (default: 40)")
-    p.add_argument("--double-row-edge-min",  type=float, default=13.0,
-                   help="zero-from-edge-min (mm) used for double-row rivets (default: 13)")
-    p.add_argument("--double-row-edge-max",  type=float, default=150.0,
-                   help="zero-from-edge-max (mm) used for double-row rivets (default: 150)")
+    p.add_argument("--double-row-edge-min",  type=float, default=30.0,
+                   help="zero-from-edge-min (mm) used for double-row rivets (default: 30)")
+    p.add_argument("--double-row-edge-max",  type=float, default=100.0,
+                   help="zero-from-edge-max (mm) used for double-row rivets (default: 100)")
     p.add_argument("--green-thresh",         type=float, default=0.05)
 
     # Deviation map
@@ -78,9 +78,9 @@ def parse_args():
     p.add_argument("--threshold", type=float, default=-0.2)
 
     # Colour zones
-    p.add_argument("--warn-lo",     type=float, default=0.13,
+    p.add_argument("--warn-lo",     type=float, default=0.16,
                    help="Orange zone start |pull-in| (mm)")
-    p.add_argument("--warn-hi",     type=float, default=0.20,
+    p.add_argument("--warn-hi",     type=float, default=0.23,
                    help="Red start |pull-in| (mm)")
     p.add_argument("--critical-hi", type=float, default=0.60,
                    help="Black (critical) start |pull-in| (mm)")
@@ -94,6 +94,14 @@ def parse_args():
     p.add_argument("--local-poly-fit-radius", type=float, default=30.0)
     p.add_argument("--local-poly-degree",     type=int,   default=2)
     p.add_argument("--local-poly-method",     choices=["exclude", "robust"], default="exclude")
+    p.add_argument("--n-beams", type=int, default=0,
+                   help="Total beam count on innermost circle (360/N angular spacing). "
+                        "0 = crown-sectors mode (default). With n_sectors=4 k_sectors=2 "
+                        "use 16 for 4 beams/sector. Boundary beams shared when N divisible "
+                        "by n_sectors.")
+    p.add_argument("--beam-noise-sigma", type=float, default=0.0,
+                   help="Std-dev (mm) of 2D Gaussian positional noise added to each beam "
+                        "target, simulating human operator imprecision. (default: 0 = off)")
     p.add_argument("--max-crown-dev-range",   type=float, default=None,
                    help="[plane] skip rivets with crown deviation range > this (mm)")
 
@@ -222,6 +230,23 @@ def process_one(ply_path, out_dir, args_dict):
         elif zpj is not None:  # only j has a zero → share with i
             zero_pts_all[i] = zpj
 
+    # ── Zero propagation ─────────────────────────────────────────────────────────
+    # Forward pass: rivets with no zero get the last valid one found.
+    # Leading Nones (no previous zero yet) accumulate in `pending` and are
+    # assigned the first valid zero encountered further along.
+    last_seen = None
+    pending   = []
+    for i in range(len(zero_pts_all)):
+        if zero_pts_all[i] is not None:
+            last_seen = zero_pts_all[i]
+            for j in pending:
+                zero_pts_all[j] = last_seen
+            pending.clear()
+        elif last_seen is not None:
+            zero_pts_all[i] = last_seen
+        else:
+            pending.append(i)   # no zero seen yet — wait for first valid one
+
     # ── Pass 2: measure each rivet using the finalised zero_pts ──────────────
     results = []
     for i, hole in enumerate(holes):
@@ -265,6 +290,8 @@ def process_one(ply_path, out_dir, args_dict):
             local_poly_fit_radius=a["local_poly_fit_radius"],
             local_poly_degree=a["local_poly_degree"],
             local_poly_method=a["local_poly_method"],
+            n_beams=a["n_beams"],
+            beam_noise_sigma=a["beam_noise_sigma"],
         )
         if res is None:
             continue
@@ -277,7 +304,7 @@ def process_one(ply_path, out_dir, args_dict):
             continue
 
         res["hole_idx"]    = i
-        res["zero_center"] = zero_pt
+        res["zero_center"] = zero_pt  # may be fallback from previous rivet
         results.append(res)
 
     if not results:

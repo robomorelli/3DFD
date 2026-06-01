@@ -268,28 +268,24 @@ def auto_r_outer(holes):
 
 # ── Auto-zero point search ────────────────────────────────────────────────────
 def find_zero_point(rivet_center, hole_radius, pts, kdtree, deviation,
-                    nominal_thresh=0.10, from_edge_min=13.0, from_edge_max=60.0,
+                    nominal_thresh=5.0, from_edge_min=13.0, from_edge_max=60.0,
                     feet_radius=13.7,
                     other_centers=None, other_radii=None,
                     mastic_centers=None, mastic_radii=None,
                     mastic_bound_tree=None, mastic_bound_r=3.0,
                     zero_search="free", crown_buffer=0.0):
     """
-    Find the nearest nominal (yellow, near-zero) vertex for zeroing.
+    Find the best zero vertex in the valid search ring around the rivet.
 
     Distances measured from hole edge:
       d_min = hole_radius + from_edge_min
-      d_max = hole_radius + from_edge_max   (up to 6 cm per NTA 70901)
+      d_max = hole_radius + from_edge_max
 
-    Selection:
-      1. Prefer candidates with |deviation| < nominal_thresh (yellow zone).
-         Among those, take the nearest.
-      2. If no nominal candidate exists, take the one with the highest
-         deviation (least red) among all non-excluded candidates.
+    Selection: among all valid candidates, take the one with minimum |deviation|.
+    Returns it only if that minimum |deviation| < nominal_thresh; else returns None
+    (caller should propagate a previously found zero rather than use a deviated point).
 
     Excludes zones covered by other rivet holes or mastic.
-
-    Returns a (3,) point array or None if no candidates remain.
     """
     d_min = hole_radius + from_edge_min
     d_max = hole_radius + from_edge_max
@@ -336,15 +332,12 @@ def find_zero_point(rivet_center, hole_radius, pts, kdtree, deviation,
     if len(idxs) == 0:
         return None
 
-    # Prefer nominal (yellow, near-zero) — take nearest among them
-    nominal = np.abs(deviation[idxs]) < nominal_thresh
-    if nominal.any():
-        sub_idxs = idxs[nominal]
-        sub_d2d  = d2d[nominal]
-        return pts[sub_idxs[np.argmin(sub_d2d)]].copy()
-
-    # Fallback: no nominal zone found — take least red (highest deviation)
-    return pts[idxs[np.argmax(deviation[idxs])]].copy()
+    # Pick the candidate with minimum |deviation| across the whole search range.
+    # Only accept it if it actually falls within the nominal threshold.
+    best = int(np.argmin(np.abs(deviation[idxs])))
+    if np.abs(deviation[idxs[best]]) < nominal_thresh:
+        return pts[idxs[best]].copy()
+    return None
 
 
 def zero_reading_at(zero_center, pts, kdtree, feet_radius, probe_radius,
@@ -423,7 +416,9 @@ def measure_crown_v1(rivet_center, hole_radius, pts, kdtree,
                      min_sector_coverage=0.3,
                      deviation_arr=None, measure_mode="plane",
                      local_poly_fit_radius=30.0, local_poly_degree=2,
-                     local_poly_method="exclude"):
+                     local_poly_method="exclude",
+                     n_beams=0,
+                     beam_noise_sigma=0.0):
     """
     Measure the annular crown [hole_r+r_inner, hole_r+r_outer] around a rivet.
 
@@ -452,11 +447,106 @@ def measure_crown_v1(rivet_center, hole_radius, pts, kdtree,
         mastic_centers=mastic_centers, mastic_radii=mastic_radii,
         mastic_bound_tree=mastic_bound_tree, mastic_bound_r=mastic_bound_r,
     )
-    if plane_n is None:
+    if plane_n is None and n_beams == 0:
         return None
+    if plane_n is None:
+        actual_feet_r, foot_max_dist, foot_ok = feet_radius, float("inf"), True
 
     r_in  = hole_radius + r_inner_mm
     r_out = hole_radius + r_outer_mm
+
+    # ── Beam-sampling mode: N fixed angular positions on the innermost circle ──
+    if n_beams > 0:
+        beam_angles = np.array([k * 2 * np.pi / n_beams for k in range(n_beams)])
+
+        targets = rivet_center + r_in * np.column_stack(
+            [np.cos(beam_angles), np.sin(beam_angles), np.zeros(n_beams)]
+        )
+        if beam_noise_sigma > 0:
+            noise_xy = np.random.normal(0.0, beam_noise_sigma, (n_beams, 2))
+            targets[:, :2] += noise_xy
+        nn_d, nn_i = kdtree.query(targets)
+        beam_mesh_pts = pts[nn_i]
+
+        # Exclude beams landing on other holes or mastic
+        valid = nn_d < r_in * 0.5
+        if other_hole_centers is not None:
+            for hc, hr in zip(other_hole_centers, other_hole_radii):
+                valid &= np.linalg.norm(beam_mesh_pts[:, :2] - np.asarray(hc[:2]), axis=1) > hr
+        if mastic_centers is not None:
+            for mc, mr in zip(mastic_centers, mastic_radii):
+                valid &= np.linalg.norm(beam_mesh_pts[:, :2] - np.asarray(mc[:2]), axis=1) > mr
+
+        # Per-point comparator at each valid beam position
+        all_hc = list(other_hole_centers or []) + [rivet_center]
+        all_hr = list(other_hole_radii   or []) + [hole_radius]
+        beam_dists = np.full(n_beams, np.nan)
+        for k in range(n_beams):
+            if not valid[k]:
+                continue
+            cp = beam_mesh_pts[k]
+            pn, fp, _, _, fok_k = find_valid_plane(
+                cp, pts, kdtree, feet_radius, foot_dist_max, feet_radius_min,
+                hole_centers=all_hc, hole_radii=all_hr,
+                mastic_centers=mastic_centers, mastic_radii=mastic_radii,
+                mastic_bound_tree=mastic_bound_tree, mastic_bound_r=mastic_bound_r,
+            )
+            if pn is not None and fok_k:
+                beam_dists[k] = float((cp - fp[0]) @ pn) - zero_offset
+
+        # Sector analysis: sector s covers beams [s*bps .. s*bps+bps].
+        # When n_beams % n_sectors == 0, boundary beams are shared between adjacent sectors.
+        bps = n_beams // n_sectors
+        shared_boundary = (n_beams % n_sectors == 0)
+        window = bps + 1 if shared_boundary else bps
+        sector_worst = np.full(n_sectors, np.nan)
+        sector_mean  = np.full(n_sectors, np.nan)
+        sector_cnt   = np.zeros(n_sectors, dtype=int)
+        for s in range(n_sectors):
+            idxs = [(s * bps + j) % n_beams for j in range(window)]
+            vals = beam_dists[idxs]
+            fin  = vals[np.isfinite(vals)]
+            if len(fin):
+                sector_worst[s] = float(fin.min())
+                sector_mean[s]  = float(fin.mean())
+                sector_cnt[s]   = len(fin)
+
+        sector_ok_b = np.isfinite(sector_worst)
+        n_pop = int(sector_ok_b.sum())
+        if n_pop < k_worst:
+            return None
+
+        sorted_w     = np.sort(sector_worst[sector_ok_b])
+        k_worst_mean = float(sorted_w[:k_worst].mean())
+        coh_mean     = float(sorted_w[k_worst:].mean()) if n_pop > k_worst else float("nan")
+        fin_all      = beam_dists[np.isfinite(beam_dists)]
+
+        return {
+            "center":            rivet_center,
+            "hole_r":            float(hole_radius),
+            "feet_r":            float(actual_feet_r),
+            "foot_max_dist":     float(foot_max_dist),
+            "foot_ok":           True,
+            "n_crown":           int(len(fin_all)),
+            "crown_mean":        float(np.mean(fin_all))       if len(fin_all) else float("nan"),
+            "crown_p10":         float(np.percentile(fin_all, 10)) if len(fin_all) else float("nan"),
+            "crown_min":         float(np.min(fin_all))        if len(fin_all) else float("nan"),
+            "k_worst_mean":      k_worst_mean,
+            "worst_sector_mean": float(np.nanmin(sector_worst)),
+            "sector_means":      [float(v) if np.isfinite(v) else None for v in sector_mean],
+            "sector_counts":     sector_cnt.tolist(),
+            "n_sectors_pop":     n_pop,
+            "n_sectors_void":    int((~sector_ok_b).sum()),
+            "n_sectors_below":   int((sector_worst[sector_ok_b] < 0).sum()),
+            "consensus_band":    0,
+            "coherence":         1.0,
+            "coherent_mean":     coh_mean,
+            "sector_grid":       [[float(v)] if np.isfinite(v) else [float("nan")]
+                                  for v in sector_mean],
+            "zero_offset":       float(zero_offset),
+            "crown_dev_range":   float("nan"),
+            "crown_dev_std":     float("nan"),
+        }
 
     cand = np.array(kdtree.query_ball_point(rivet_center, r_out), dtype=np.int32)
     if len(cand) == 0:
@@ -721,19 +811,31 @@ def make_static_plot(pts, holes, mastics, results, threshold, label, out_path, a
 
         ax.add_patch(plt.Circle((c[0], c[1]), r["hole_r"],
                                 color=col, fill=True, alpha=alpha, linewidth=0))
-        ax.add_patch(plt.Circle((c[0], c[1]), r["hole_r"] + args.r_outer,
+        r_in  = r["hole_r"] + args.r_inner
+        beam_mode = getattr(args, "n_beams", 0) > 0
+        r_crown = r_in if beam_mode else r["hole_r"] + args.r_outer
+
+        ax.add_patch(plt.Circle((c[0], c[1]), r_crown,
                                 color=col, fill=False, linewidth=0.8,
                                 alpha=0.5, linestyle=ls))
 
         # Crown grid: radial band rings + sector dividers
-        r_in  = r["hole_r"] + args.r_inner
-        r_out = r["hole_r"] + args.r_outer
-        band_w   = (r_out - r_in) / args.n_radial_bands
+        r_out = r_crown
         sector_w = 2 * np.pi / args.n_sectors
-        for k in range(args.n_radial_bands):
-            ax.add_patch(plt.Circle((c[0], c[1]), r_in + k * band_w,
-                                    color="gray", fill=False, linewidth=0.4,
-                                    alpha=0.35, linestyle="--", zorder=2))
+        if not beam_mode:
+            band_w = (r_out - r_in) / args.n_radial_bands
+            for k in range(args.n_radial_bands):
+                ax.add_patch(plt.Circle((c[0], c[1]), r_in + k * band_w,
+                                        color="gray", fill=False, linewidth=0.4,
+                                        alpha=0.35, linestyle="--", zorder=2))
+        else:
+            # beam-sampling: draw beam markers on the inner circle
+            for k in range(args.n_beams):
+                theta = k * 2 * np.pi / args.n_beams
+                bx = c[0] + r_in * np.cos(theta)
+                by = c[1] + r_in * np.sin(theta)
+                ax.plot(bx, by, marker="o", ms=2, color=col,
+                        lw=0, alpha=0.7, zorder=4)
         for k in range(args.n_sectors):
             theta = -np.pi + k * sector_w
             ct, st = np.cos(theta), np.sin(theta)
