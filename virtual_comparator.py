@@ -1759,22 +1759,47 @@ def main():
     for mc, mr in zip(mastic_centers, mastic_radii):
         d_mc = np.linalg.norm(pts[:, :2] - np.asarray(mc[:2]), axis=1)
         global_forbidden |= d_mc < (mr + args.feet_radius + 2.0)
-    if panel_boundary_tree is not None:
-        d_edge, _ = panel_boundary_tree.query(pts[:, :2])
-        global_forbidden |= d_edge < args.boundary_excl_r
+    # Boundary exclusion via 2D convex hull of scan (robust, topology-independent)
+    from scipy.spatial import ConvexHull as _ConvexHull
+    panel_boundary_pts = None
+    hull_tree = None
+    try:
+        hull = _ConvexHull(pts[:, :2])
+        hv = pts[hull.vertices, :2]
+        n = len(hv)
+        segs = []
+        for k in range(n):
+            p0, p1 = hv[k], hv[(k + 1) % n]
+            n_pts = max(2, int(np.linalg.norm(p1 - p0)))
+            segs.append(np.linspace(p0, p1, n_pts))
+        panel_boundary_pts = np.concatenate(segs)
+        hull_tree = cKDTree(panel_boundary_pts)
+        d_hull, _ = hull_tree.query(pts[:, :2])
+        global_forbidden |= d_hull <= args.boundary_excl_r
+        print(f"    Convex hull boundary: {n} vertices, excl {args.boundary_excl_r} mm")
+    except Exception as e:
+        print(f"    Warning: convex hull failed ({e}), falling back to mesh boundary")
+        if panel_boundary_tree is not None:
+            d_edge, _ = panel_boundary_tree.query(pts[:, :2])
+            global_forbidden |= d_edge <= args.boundary_excl_r
+
     n_allowed = int((~global_forbidden).sum())
     print(f"    Allowed vertices: {n_allowed:,} / {len(pts):,} "
           f"({100*n_allowed/len(pts):.1f}%)")
 
-    # Identify edge rivets (centre within edge_rivet_r of panel boundary)
+    # Identify edge rivets (centre within edge_rivet_r of scan boundary)
     is_edge_rivet = np.zeros(len(holes), dtype=bool)
-    if panel_boundary_tree is not None:
+    if hull_tree is not None:
+        rivet_centers_2d = np.array([h["center"][:2] for h in holes])
+        d_to_boundary, _ = hull_tree.query(rivet_centers_2d)
+        is_edge_rivet = d_to_boundary < args.edge_rivet_r
+    elif panel_boundary_tree is not None:
         rivet_centers_2d = np.array([h["center"][:2] for h in holes])
         d_to_boundary, _ = panel_boundary_tree.query(rivet_centers_2d)
         is_edge_rivet = d_to_boundary < args.edge_rivet_r
-        n_edge = int(is_edge_rivet.sum())
-        if n_edge:
-            print(f"    Edge rivets (within {args.edge_rivet_r} mm of boundary): {n_edge}")
+    n_edge = int(is_edge_rivet.sum())
+    if n_edge:
+        print(f"    Edge rivets (within {args.edge_rivet_r} mm of boundary): {n_edge}")
 
     # ── Pass 1: find zero points ──────────────────────────────────────────────
     print(f"\n[5a] Finding zero points for {len(holes)} rivets …")
