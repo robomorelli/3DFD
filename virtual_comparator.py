@@ -262,18 +262,18 @@ def parse_args():
                    help="[deviation] Max |deviation| to qualify as nominal for zeroing (mm).")
     p.add_argument("--zero-from-edge-min", type=float, default=2.0,
                    help="Inner exclusion half-side from hole edge (mm) — square boundary")
-    p.add_argument("--zero-from-edge-max", type=float, default=70.0,
-                   help="Outer search half-side from hole edge (mm) — square boundary")
+    p.add_argument("--zero-from-edge-max", type=float, default=40.0,
+                   help="Outer search half-side from hole edge (mm) — square boundary. "
+                        "Also sets the local-dev poly-fit radius unless overridden.")
 
     # local-dev zeroing
     p.add_argument("--zero-pull-in-buffer", type=float, default=2.0,
                    help="[local-dev] Extra buffer beyond hole edge excluded from the local "
                         "polynomial fit (mm). Prevents pull-in from biasing the reference.")
-    p.add_argument("--zero-local-fit-radius", type=float, default=30.0,
+    p.add_argument("--zero-local-fit-radius", type=float, default=None,
                    help="[local-dev] Radius (mm) of the local polynomial fit region "
-                        "centred on the rivet (diameter = 2×this value). "
-                        "Fit domain is the annulus [hole_r + pull_in_buffer, this value]. "
-                        "Default 30 mm → 60×60 mm area.")
+                        "centred on the rivet. Defaults to --zero-from-edge-max so the "
+                        "fit and search areas are always equal.")
     p.add_argument("--zero-dev-weight", type=float, default=0.5,
                    help="[local-dev] Weight of the local-deviation term in the composite penalty.")
     p.add_argument("--zero-dist-weight", type=float, default=0.3,
@@ -506,37 +506,43 @@ def _candidate_band(rivet_center, hole_radius, pts, kdtree,
                     mastic_bound_tree, mastic_bound_r,
                     zero_search, crown_buffer,
                     excl_other_buffer=10.0,
-                    panel_boundary_tree=None, boundary_excl_r=15.0):
+                    panel_boundary_tree=None, boundary_excl_r=15.0,
+                    global_forbidden=None):
     """
     Return candidate zero vertex indices in the search band after all exclusions.
 
-    Search band shape: SQUARE
-      - Inner: exclude if inside square of half-side (hole_r + from_edge_min)
-               → point kept if |dx| >= d_min  OR  |dy| >= d_min
-      - Outer: keep only if inside square of half-side (hole_r + from_edge_max)
-               → point kept if |dx| <= d_max  AND  |dy| <= d_max
+    If global_forbidden is provided (boolean array over all vertices, pre-computed
+    as the union of ALL rivets + mastics + boundary exclusion zones), it is used
+    directly — no per-rivet iteration needed.  Otherwise falls back to the legacy
+    per-rivet exclusion loops.
 
-    Other exclusions:
-      - Other rivets: SQUARE of half-side (hole_r + excl_other_buffer) — union of all
-      - Mastic zones
-      - Panel outer boundary (boundary_excl_r from scan edge)
+    Search band (rivet-specific, always applied):
+      - Outer square: half-side = hole_r + from_edge_max
+      - Inner exclusion: candidates within the global_forbidden mask are removed,
+        which implicitly excludes own rivet zone (hole_r + excl_other_buffer).
     """
-    d_min = hole_radius + from_edge_min
     d_max = hole_radius + from_edge_max
 
-    # Over-fetch with bounding circle of the outer square, then apply square filter
+    # Over-fetch with circumscribed circle, then clip to outer square
     idxs = np.array(kdtree.query_ball_point(rivet_center, d_max * 1.4143), dtype=np.int32)
     if len(idxs) == 0:
         return np.empty(0, dtype=np.int32)
 
     dx = pts[idxs, 0] - float(rivet_center[0])
     dy = pts[idxs, 1] - float(rivet_center[1])
+    idxs = idxs[(np.abs(dx) <= d_max) & (np.abs(dy) <= d_max)]
+    if len(idxs) == 0:
+        return np.empty(0, dtype=np.int32)
 
-    # Outer square: keep inside
-    outer_mask = (np.abs(dx) <= d_max) & (np.abs(dy) <= d_max)
-    # Inner square: keep outside (exclude own rivet zone)
-    inner_mask = (np.abs(dx) >= d_min) | (np.abs(dy) >= d_min)
-    idxs = idxs[outer_mask & inner_mask]
+    if global_forbidden is not None:
+        # Global mask already encodes: all rivets + mastics + boundary
+        return idxs[~global_forbidden[idxs]]
+
+    # ── Legacy per-rivet exclusion (used when global_forbidden is not available) ──
+    d_min = hole_radius + from_edge_min
+    dx = pts[idxs, 0] - float(rivet_center[0])
+    dy = pts[idxs, 1] - float(rivet_center[1])
+    idxs = idxs[(np.abs(dx) >= d_min) | (np.abs(dy) >= d_min)]
     if len(idxs) == 0:
         return np.empty(0, dtype=np.int32)
 
@@ -546,11 +552,10 @@ def _candidate_band(rivet_center, hole_radius, pts, kdtree,
         for oc, or_ in zip(other_centers, other_radii):
             if np.linalg.norm(np.asarray(oc[:2]) - rivet_center[:2]) < 1e-3:
                 continue
-            # Square exclusion: exclude if inside the box of this other rivet
             half = or_ + extra + excl_other_buffer
             dx = np.abs(pts[idxs, 0] - float(oc[0]))
             dy = np.abs(pts[idxs, 1] - float(oc[1]))
-            keep &= (dx >= half) | (dy >= half)  # outside the square
+            keep &= (dx >= half) | (dy >= half)
         idxs = idxs[keep]
 
     if mastic_centers is not None and len(mastic_centers) > 0:
@@ -596,7 +601,8 @@ def find_zero_point_flatness(rivet_center, hole_radius, pts, kdtree,
                               flatness_radius=3.0, max_candidates=256,
                               excl_other_buffer=10.0,
                               panel_boundary_tree=None, boundary_excl_r=15.0,
-                              w_open=0.3, open_scale=20.0):
+                              w_open=0.3, open_scale=20.0,
+                              global_forbidden=None):
     """
     Find the zero vertex with minimum local surface roughness.
     Score = roughness_norm + w_open * proximity_to_other_rivets
@@ -613,6 +619,7 @@ def find_zero_point_flatness(rivet_center, hole_radius, pts, kdtree,
         zero_search, crown_buffer,
         excl_other_buffer=excl_other_buffer,
         panel_boundary_tree=panel_boundary_tree, boundary_excl_r=boundary_excl_r,
+        global_forbidden=global_forbidden,
     )
     if len(idxs) == 0:
         return None, float("inf")
@@ -640,7 +647,8 @@ def find_zero_point_deviation(rivet_center, hole_radius, pts, kdtree, deviation,
                                zero_search="free", crown_buffer=0.0,
                                excl_other_buffer=10.0,
                                panel_boundary_tree=None, boundary_excl_r=15.0,
-                               w_open=0.3, open_scale=20.0):
+                               w_open=0.3, open_scale=20.0,
+                               global_forbidden=None):
     """
     Global-deviation zeroing: pick vertex with minimum |global deviation|,
     penalising proximity to other rivets to prefer open fields.
@@ -738,7 +746,12 @@ def compute_local_deviation_patch(rivet_center, pts, kdtree,
     Returns polynomial coefficients (centred on rivet_center) or None if the
     fit is underdetermined after exclusions.
     """
-    all_cand = np.array(kdtree.query_ball_point(rivet_center, fit_radius), dtype=np.int32)
+    # Direct square filter on the full point array — no KD-tree needed
+    cx, cy = float(rivet_center[0]), float(rivet_center[1])
+    all_cand = np.where(
+        (np.abs(pts[:, 0] - cx) <= fit_radius) &
+        (np.abs(pts[:, 1] - cy) <= fit_radius)
+    )[0].astype(np.int32)
     if len(all_cand) == 0:
         return None
 
@@ -756,7 +769,6 @@ def compute_local_deviation_patch(rivet_center, pts, kdtree,
     if len(fit_idx) < min_pts:
         return None
 
-    cx, cy = float(rivet_center[0]), float(rivet_center[1])
     xf = pts[fit_idx, 0] - cx
     yf = pts[fit_idx, 1] - cy
     coeffs, _, _, _ = np.linalg.lstsq(
@@ -789,7 +801,8 @@ def find_zero_point_local_dev(rivet_center, hole_radius, pts, kdtree,
                                rough_scale=0.003,
                                excl_other_buffer=10.0,
                                panel_boundary_tree=None, boundary_excl_r=15.0,
-                               w_open=0.2, open_scale=20.0):
+                               w_open=0.2, open_scale=20.0,
+                               global_forbidden=None):
     """
     Score zero candidates with a composite penalty:
 
@@ -1404,15 +1417,16 @@ def make_zero_feasibility_plot(pts, holes, mastics, results, label, out_path, ar
             color="steelblue", fill=False, linewidth=0.5,
             linestyle=":", alpha=0.3, zorder=4))
 
-        # Green area: local poly-fit domain (local-dev only)
+        # Green square: local poly-fit domain (local-dev only)
         if is_local_dev:
-            ax.add_patch(plt.Circle((c[0], c[1]), fit_radius,
-                                    color="limegreen", fill=True, alpha=0.06,
-                                    linewidth=0, zorder=2))
-            ax.add_patch(plt.Circle((c[0], c[1]), fit_radius,
-                                    color="limegreen", fill=False, linewidth=0.7,
-                                    linestyle="-", alpha=0.5, zorder=4))
-            # Inner pull-in exclusion — black so extent is clearly visible
+            ax.add_patch(plt.Rectangle(
+                (c[0] - fit_radius, c[1] - fit_radius), 2 * fit_radius, 2 * fit_radius,
+                color="limegreen", fill=True, alpha=0.06, linewidth=0, zorder=2))
+            ax.add_patch(plt.Rectangle(
+                (c[0] - fit_radius, c[1] - fit_radius), 2 * fit_radius, 2 * fit_radius,
+                color="limegreen", fill=False, linewidth=0.7,
+                linestyle="-", alpha=0.5, zorder=4))
+            # Inner pull-in exclusion — black circle (hole boundary + buffer)
             ax.add_patch(plt.Circle((c[0], c[1]), hr + pull_in_buf,
                                     color="black", fill=False, linewidth=0.8,
                                     linestyle="-", alpha=0.7, zorder=6))
@@ -1624,6 +1638,8 @@ def save_csv(results, label, out_path):
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     args  = parse_args()
+    if args.zero_local_fit_radius is None:
+        args.zero_local_fit_radius = args.zero_from_edge_max
     os.makedirs(args.out_dir, exist_ok=True)
     label = os.path.splitext(os.path.basename(args.ply))[0]
 
@@ -1765,6 +1781,21 @@ def main():
         zero_pts.append(zp)
         zero_scores.append(zs)
 
+    # Post-validate: discard any zero that landed inside another rivet's forbidden zone
+    excl_buf = args.zero_excl_other_buffer
+    for i in range(len(holes)):
+        if zero_pts[i] is None:
+            continue
+        zp = zero_pts[i]
+        for j in range(len(holes)):
+            if j == i:
+                continue
+            half = all_radii[j] + excl_buf
+            if abs(zp[0] - all_centers[j][0]) < half and abs(zp[1] - all_centers[j][1]) < half:
+                zero_pts[i]   = None
+                zero_scores[i] = float("inf")
+                break
+
     # ── Pass 2: share zero points among N nearest-neighbour rivets ────────────
     zero_shared_from = list(range(len(holes)))  # index of donor rivet
 
@@ -1775,24 +1806,101 @@ def main():
         k    = min(args.zero_share_nn + 1, len(holes))
         _, nn_idxs = rkd.query(centers_2d, k=k)  # shape (n_rivets, k)
 
+        donor_centers = np.array([h["center"][:2] for h in holes])
+        donor_tree    = cKDTree(donor_centers)
+        k_query       = min(args.zero_share_nn + 1, len(holes))
+        all_c2        = np.array(all_centers, dtype=np.float64)[:, :2]
+        all_r2        = np.array(all_radii,   dtype=np.float64)
+
+        def _zero_valid_for(zp, ci, ri):
+            """True if zp is in rivet i's search band and outside ALL rivets' forbidden zones."""
+            adx = abs(zp[0] - ci[0])
+            ady = abs(zp[1] - ci[1])
+            d_min_i = ri + args.zero_from_edge_min
+            d_max_i = ri + args.zero_from_edge_max
+            if not (
+                (adx <= d_max_i) and (ady <= d_max_i) and
+                ((adx >= d_min_i) or (ady >= d_min_i)) and
+                np.linalg.norm(zp[:2] - np.asarray(ci[:2])) > ri
+            ):
+                return False
+            # Reject if inside any OTHER rivet's forbidden zone
+            for cj, rj in zip(all_centers, all_radii):
+                if abs(float(cj[0]) - float(ci[0])) < 1e-3 and abs(float(cj[1]) - float(ci[1])) < 1e-3:
+                    continue  # skip self
+                half = rj + excl_buf
+                if abs(float(zp[0]) - float(cj[0])) < half and abs(float(zp[1]) - float(cj[1])) < half:
+                    return False
+            return True
+
+        def _openness(zp):
+            """Min clearance from zero point to any rivet edge (universal quality metric)."""
+            return float((np.linalg.norm(all_c2 - zp[:2], axis=1) - all_r2).min())
+
+        # Openness-based sharing: among self + N nearest neighbours pick the zero
+        # with the highest openness (farthest from all rivets).
+        # This ensures outer-row open-field zeros propagate inward to inner rows.
         for i in range(len(holes)):
-            group = nn_idxs[i]  # self + N neighbors
-            best_score = zero_scores[i] if zero_pts[i] is not None else float("inf")
-            best_j     = i
-            for j in group:
-                if zero_pts[j] is None:
+            ci = holes[i]["center"]
+            ri = holes[i]["radius_mm"]
+            best_open = _openness(zero_pts[i]) if zero_pts[i] is not None else -float("inf")
+            best_j    = i
+            _, nbrs = donor_tree.query(ci[:2], k=k_query)
+            for j in np.atleast_1d(nbrs):
+                if j == i or zero_pts[j] is None:
                     continue
-                s = zero_scores[j]
-                if np.isfinite(s) and s < best_score:
-                    best_score = s
-                    best_j     = j
+                if not _zero_valid_for(zero_pts[j], ci, ri):
+                    continue
+                op = _openness(zero_pts[j])
+                if op > best_open:
+                    best_open = op
+                    best_j    = j
             if best_j != i:
-                zero_pts[i]        = zero_pts[best_j]
-                zero_scores[i]     = zero_scores[best_j]
+                zero_pts[i]         = zero_pts[best_j]
+                zero_scores[i]      = zero_scores[best_j]
                 zero_shared_from[i] = best_j
 
+        # Fallback: rivets still without zero → nearest valid donor in whole panel
+        fallback_count = 0
+        for i in range(len(holes)):
+            if zero_pts[i] is not None:
+                continue
+            ci = holes[i]["center"]
+            ri = holes[i]["radius_mm"]
+            _, all_j = donor_tree.query(ci[:2], k=len(holes))
+            for j in np.atleast_1d(all_j):
+                if j == i or zero_pts[j] is None:
+                    continue
+                if _zero_valid_for(zero_pts[j], ci, ri):
+                    zero_pts[i]         = zero_pts[j]
+                    zero_scores[i]      = zero_scores[j]
+                    zero_shared_from[i] = j
+                    fallback_count     += 1
+                    break
+
         n_shared = sum(1 for i, d in enumerate(zero_shared_from) if d != i)
-        print(f"    Shared zeros: {n_shared}/{len(holes)} rivets use a neighbour's zero")
+        print(f"    Shared zeros: {n_shared}/{len(holes)} rivets use a neighbour's zero "
+              f"(fallback: {fallback_count})")
+
+        # Final post-validation: discard any zero (including shared) in a forbidden zone
+        discarded = 0
+        for i in range(len(holes)):
+            if zero_pts[i] is None:
+                continue
+            zp = zero_pts[i]
+            ci = holes[i]["center"]
+            for j in range(len(holes)):
+                if j == i:
+                    continue
+                half = all_radii[j] + excl_buf
+                if abs(zp[0] - all_centers[j][0]) < half and abs(zp[1] - all_centers[j][1]) < half:
+                    zero_pts[i]        = None
+                    zero_scores[i]     = float("inf")
+                    zero_shared_from[i] = i
+                    discarded += 1
+                    break
+        if discarded:
+            print(f"    Final post-validation: {discarded} zeros discarded (in forbidden zone after sharing)")
 
     # ── Pass 3: compute zero offsets and measure crowns ───────────────────────
     print(f"[5c] Measuring {len(holes)} rivets …")
