@@ -193,7 +193,8 @@ def build_panel_boundary_tree(faces, pts,
 
     if not outer_verts:
         return None, None
-    return cKDTree(pts[outer_verts, :2]), None
+    bpts = pts[outer_verts, :2]
+    return cKDTree(bpts), bpts
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -290,9 +291,13 @@ def parse_args():
                    help="Min clearance (mm) from any OTHER rivet's hole edge for a valid zero "
                         "candidate.  Total exclusion = other_hole_r + this value.  "
                         "Increase to prevent the zero from landing between two adjacent rivets.")
-    p.add_argument("--boundary-excl-r", type=float, default=15.0,
+    p.add_argument("--boundary-excl-r", type=float, default=30.0,
                    help="Hard exclusion zone (mm) from the outer panel boundary (scan edge). "
                         "Zero candidates within this distance are discarded.")
+    p.add_argument("--edge-rivet-r", type=float, default=20.0,
+                   help="Rivets whose centre is within this distance (mm) from the panel "
+                        "boundary are treated as edge rivets: they receive the nearest "
+                        "non-forbidden zero from any other rivet, ignoring the d_max constraint.")
     p.add_argument("--zero-open-weight", type=float, default=0.2,
                    help="Soft penalty weight for proximity to other rivets. "
                         "Higher = stronger preference for open fields away from rivets.")
@@ -663,6 +668,7 @@ def find_zero_point_deviation(rivet_center, hole_radius, pts, kdtree, deviation,
         zero_search, crown_buffer,
         excl_other_buffer=excl_other_buffer,
         panel_boundary_tree=panel_boundary_tree, boundary_excl_r=boundary_excl_r,
+        global_forbidden=global_forbidden,
     )
     if len(idxs) == 0:
         return None, float("nan")
@@ -840,6 +846,7 @@ def find_zero_point_local_dev(rivet_center, hole_radius, pts, kdtree,
         zero_search, crown_buffer,
         excl_other_buffer=excl_other_buffer,
         panel_boundary_tree=panel_boundary_tree, boundary_excl_r=boundary_excl_r,
+        global_forbidden=global_forbidden,
     )
     if len(idxs) == 0:
         return None, float("inf")
@@ -1348,7 +1355,8 @@ def make_zero_plot(pts, mastics, results, label, out_path, args):
 
 
 # ── Zero feasibility plot ─────────────────────────────────────────────────────
-def make_zero_feasibility_plot(pts, holes, mastics, results, label, out_path, args):
+def make_zero_feasibility_plot(pts, holes, mastics, results, label, out_path, args,
+                               panel_boundary_pts=None):
     """
     Top-down map showing for each rivet:
       • Gray filled circle      = rivet hole (forbidden zone)
@@ -1379,9 +1387,18 @@ def make_zero_feasibility_plot(pts, holes, mastics, results, label, out_path, ar
         fontsize=10, fontweight="bold",
     )
 
+    boundary_excl = getattr(args, "boundary_excl_r", 25.0)
+
     # Surface point cloud
     ax.scatter(pts[::step, 0], pts[::step, 1], c=pts[::step, 2],
                s=0.08, cmap="gray", rasterized=True, alpha=0.35, zorder=1)
+
+    # Panel boundary — magenta dots on scan perimeter, clearly visible
+    if panel_boundary_pts is not None and len(panel_boundary_pts) > 0:
+        bstep = max(1, len(panel_boundary_pts) // 4000)
+        ax.scatter(panel_boundary_pts[::bstep, 0], panel_boundary_pts[::bstep, 1],
+                   s=8, c="magenta", alpha=0.9, linewidths=0, zorder=7,
+                   label=f"Bordo scan (excl {boundary_excl:.0f} mm)")
 
     # Mastic zones
     for m in mastics:
@@ -1679,7 +1696,7 @@ def main():
                                 r_min=args.hole_r_min, r_max=args.hole_r_max)
     print(f"    Rivets: {len(holes)}   Mastic: {len(mastics)}")
 
-    panel_boundary_tree, _ = build_panel_boundary_tree(
+    panel_boundary_tree, panel_boundary_pts = build_panel_boundary_tree(
         faces, pts, r_min=args.hole_r_min, r_max=args.hole_r_max)
     if panel_boundary_tree is not None:
         print(f"    Panel boundary tree built  (excl-r={args.boundary_excl_r} mm)")
@@ -1730,6 +1747,35 @@ def main():
     other_radii_list   = [[all_radii[j]   for j in range(len(holes)) if j != i]
                           for i in range(len(holes))]
 
+    # Build global forbidden zone mask — union of ALL rivets' exclusion squares
+    # + mastic zones + panel boundary.  Zero candidates must lie outside this mask.
+    print("[4b] Building global forbidden zone mask …")
+    excl_buf = args.zero_excl_other_buffer
+    global_forbidden = np.zeros(len(pts), dtype=bool)
+    for c, r in zip(all_centers, all_radii):
+        half = r + excl_buf
+        global_forbidden |= (np.abs(pts[:, 0] - float(c[0])) <= half) & \
+                             (np.abs(pts[:, 1] - float(c[1])) <= half)
+    for mc, mr in zip(mastic_centers, mastic_radii):
+        d_mc = np.linalg.norm(pts[:, :2] - np.asarray(mc[:2]), axis=1)
+        global_forbidden |= d_mc < (mr + args.feet_radius + 2.0)
+    if panel_boundary_tree is not None:
+        d_edge, _ = panel_boundary_tree.query(pts[:, :2])
+        global_forbidden |= d_edge < args.boundary_excl_r
+    n_allowed = int((~global_forbidden).sum())
+    print(f"    Allowed vertices: {n_allowed:,} / {len(pts):,} "
+          f"({100*n_allowed/len(pts):.1f}%)")
+
+    # Identify edge rivets (centre within edge_rivet_r of panel boundary)
+    is_edge_rivet = np.zeros(len(holes), dtype=bool)
+    if panel_boundary_tree is not None:
+        rivet_centers_2d = np.array([h["center"][:2] for h in holes])
+        d_to_boundary, _ = panel_boundary_tree.query(rivet_centers_2d)
+        is_edge_rivet = d_to_boundary < args.edge_rivet_r
+        n_edge = int(is_edge_rivet.sum())
+        if n_edge:
+            print(f"    Edge rivets (within {args.edge_rivet_r} mm of boundary): {n_edge}")
+
     # ── Pass 1: find zero points ──────────────────────────────────────────────
     print(f"\n[5a] Finding zero points for {len(holes)} rivets …")
     zero_pts       = []   # zero_pt  per rivet (may be None)
@@ -1751,6 +1797,7 @@ def main():
             boundary_excl_r=args.boundary_excl_r,
             w_open=args.zero_open_weight,
             open_scale=args.zero_open_scale,
+            global_forbidden=global_forbidden,
         )
         if args.zero_method == "local-dev":
             zp, zs = find_zero_point_local_dev(
@@ -1860,7 +1907,7 @@ def main():
                 zero_scores[i]      = zero_scores[best_j]
                 zero_shared_from[i] = best_j
 
-        # Fallback: rivets still without zero → nearest valid donor in whole panel
+        # Fallback pass A: try nearest valid donor with distance constraints
         fallback_count = 0
         for i in range(len(holes)):
             if zero_pts[i] is not None:
@@ -1877,6 +1924,26 @@ def main():
                     zero_shared_from[i] = j
                     fallback_count     += 1
                     break
+
+        # Fallback pass B: EDGE rivets still without zero →
+        # nearest non-forbidden zero, no distance constraint.
+        # Only applies to rivets near the panel boundary (is_edge_rivet).
+        # Interior rivets without zero keep offset=0 to avoid cross-zone bias.
+        fallback_b_count = 0
+        for i in range(len(holes)):
+            if zero_pts[i] is not None or not is_edge_rivet[i]:
+                continue
+            _, all_j = donor_tree.query(holes[i]["center"][:2], k=len(holes))
+            for j in np.atleast_1d(all_j):
+                if j == i or zero_pts[j] is None:
+                    continue
+                zero_pts[i]         = zero_pts[j]
+                zero_scores[i]      = zero_scores[j]
+                zero_shared_from[i] = j
+                fallback_b_count   += 1
+                break
+        if fallback_b_count:
+            print(f"    Fallback-B edge (no d_max): {fallback_b_count} edge rivets assigned nearest zero")
 
         n_shared = sum(1 for i, d in enumerate(zero_shared_from) if d != i)
         print(f"    Shared zeros: {n_shared}/{len(holes)} rivets use a neighbour's zero "
@@ -2042,7 +2109,8 @@ def main():
 
         out_feasibility = os.path.join(zeroing_dir, f"{label}_zero_feasibility.png")
         make_zero_feasibility_plot(pts, holes, mastics, results, label,
-                                   out_feasibility, args)
+                                   out_feasibility, args,
+                                   panel_boundary_pts=panel_boundary_pts)
         print(f"    → {out_feasibility}")
 
     if args.interactive:
