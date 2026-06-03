@@ -1,27 +1,27 @@
 """
 Virtual Comparator v2 for 3DFD surface defect detection.
 
-Improvements over v1:
-  1. LOCAL-FLATNESS ZEROING: instead of finding the vertex with minimum
-     global-deviation-map residual, v2 finds the vertex with minimum
-     *local surface roughness* — the std of signed distances to a locally-
-     fitted plane within a small radius (default 3 mm).
-     This mimics how annotators physically zero the comparator: they use
-     a torch to find the visually flattest area near the rivet, not the
-     area closest to a global polynomial reference.
-  2. DEVIATION MAP IS OPTIONAL: computing the global deviation map is
-     skipped unless --measure-mode=deviation, --zero-method=deviation,
-     or --max-crown-dev-range is set.  Default run is faster.
-  3. ZERO ROUGHNESS DIAGNOSTIC: the CSV includes the local roughness at
-     the chosen zero point so that per-rivet zeroing quality can be audited.
+Three zeroing strategies (--zero-method):
+  flatness   Minimum local surface roughness — std of signed distances to a
+             locally-fitted plane within --zero-flatness-radius (default 3 mm).
+             Mimics the operator zeroing on the visually flattest area near
+             the rivet.  No global deviation map required.
+  local-dev  Composite score: local polynomial deviation + distance from rivet
+             + neighbourhood roughness.  More discriminative than flatness alone.
+             No global deviation map required.
+  deviation  Minimum global deviation-map residual (legacy v1 behaviour).
+             Requires computing the full polynomial+Gaussian reference surface.
 
-All crown measurement, sector analysis, and plot logic is unchanged from v1.
+Crown measurement and sector analysis are common to all methods:
+  - Annular probe zone [r_inner, r_outer] mm outside the hole boundary.
+  - N angular sectors; k_worst_mean = mean of K worst sectors → robust to
+    half-corona pull-in.
 
 Usage:
-      python virtual_comparator_v2.py --ply data/pc/Surface8_clean.ply
+  python virtual_comparator_v2.py --ply data/pc/Surface8_clean.ply
   python virtual_comparator_v2.py --ply data/pc/Surface8_clean.ply \\
-      --r-inner 1.5 --r-outer 7 --n-sectors 8 --k-sectors 4 \\
-      --threshold -0.2
+      --zero-method flatness --r-inner 1.5 --r-outer 7 \\
+      --n-sectors 8 --k-sectors 4 --threshold -0.2
 """
 
 import argparse
@@ -75,31 +75,60 @@ def parse_args():
                    help="Number of worst sectors to average (default 2 = half-corona)")
     p.add_argument("--n-radial-bands", type=int, default=3,
                    help="Radial subdivisions per sector (inner→outer).")
+    p.add_argument("--n-beams", type=int, default=0,
+                   help="If >0 switch to beam mode: N probes placed at r_inner on the crown "
+                        "ring. Each beam gets its own 3-foot plane. Overrides crown-sector "
+                        "area mode. Recommended: multiples of --n-sectors (e.g. 16 with 4 sectors).")
+    p.add_argument("--beam-noise-sigma", type=float, default=0.0,
+                   help="Gaussian XY noise added to beam target positions (mm). "
+                        "0 = deterministic placement.")
 
     # Zero method
-    p.add_argument("--zero-method", choices=["flatness", "deviation", "learned"],
-                   default="flatness",
-                   help="flatness: pick zero at vertex with minimum local surface roughness "
-                        "(mimics annotator torch inspection — finds flattest spot). "
-                        "deviation: legacy v1 behaviour — pick vertex with minimum global "
-                        "deviation-map residual. "
-                        "learned: score candidates with a trained RF model (--zero-model).")
-    p.add_argument("--zero-model", default=None,
-                   help="[learned] path to the trained model (.pkl from train_zero_selector.py)")
+    p.add_argument("--zero-method", choices=["flatness", "deviation", "local-dev"],
+                   default="local-dev",
+                   help="local-dev: composite scoring — local polynomial deviation + distance "
+                        "+ neighbourhood roughness (recommended). "
+                        "flatness: minimum local surface roughness (mimics torch inspection). "
+                        "deviation: legacy v1 — minimum global deviation-map residual.")
     p.add_argument("--zero-flatness-radius", type=float, default=3.0,
-                   help="[flatness] radius (mm) of the local neighbourhood used to compute "
-                        "surface roughness at each zero candidate. Smaller = more local "
-                        "(sensitive to mesh noise); larger = smoother estimate.")
+                   help="[flatness/local-dev] radius (mm) of the local neighbourhood used to "
+                        "compute surface roughness at each zero candidate.")
     p.add_argument("--zero-probe-radius", type=float, default=4.0,
                    help="Probe disc radius at zero point (mm)")
     p.add_argument("--green-thresh", type=float, default=0.05,
                    help="Max |deviation| for reporting green vertex count (mm)")
     p.add_argument("--zero-nominal-thresh", type=float, default=0.10,
                    help="[deviation] Max |deviation| to qualify as nominal for zeroing (mm).")
-    p.add_argument("--zero-from-edge-min", type=float, default=13.0,
+    p.add_argument("--zero-from-edge-min", type=float, default=20.0,
                    help="Min distance from hole edge to zero center (mm)")
-    p.add_argument("--zero-from-edge-max", type=float, default=60.0,
+    p.add_argument("--zero-from-edge-max", type=float, default=80.0,
                    help="Max distance from hole edge to zero center (mm)")
+
+    # local-dev zeroing
+    p.add_argument("--zero-pull-in-buffer", type=float, default=2.0,
+                   help="[local-dev] Extra buffer beyond hole edge excluded from the local "
+                        "polynomial fit (mm). Prevents pull-in from biasing the reference.")
+    p.add_argument("--zero-local-fit-radius", type=float, default=None,
+                   help="[local-dev] Radius of the local polynomial fit region (mm). "
+                        "Default: hole_radius + zero-from-edge-max.")
+    p.add_argument("--zero-dev-weight", type=float, default=0.5,
+                   help="[local-dev] Weight of the local-deviation term in the composite penalty.")
+    p.add_argument("--zero-dist-weight", type=float, default=0.3,
+                   help="[local-dev] Weight of the distance-from-rivet term.")
+    p.add_argument("--zero-rough-weight", type=float, default=0.2,
+                   help="[local-dev] Weight of the neighbourhood-roughness term.")
+    p.add_argument("--zero-dev-scale", type=float, default=0.05,
+                   help="[local-dev] Deviation normalisation scale (mm). "
+                        "1 unit = one green-threshold worth of deviation.")
+    p.add_argument("--zero-rough-scale", type=float, default=0.003,
+                   help="[local-dev] Roughness normalisation scale (mm). "
+                        "Default 0.003 = 3 µm, typical clean-surface mesh roughness.")
+    p.add_argument("--zero-excl-other-buffer", type=float, default=10.0,
+                   help="Min clearance (mm) from any OTHER rivet's hole edge for a valid zero "
+                        "candidate.  Total exclusion = other_hole_r + this value.  "
+                        "Increase to prevent the zero from landing between two adjacent rivets.")
+    p.add_argument("--zeroing-out-dir", default=None,
+                   help="Directory for zeroing feasibility plots.  Defaults to --out-dir.")
 
     # Deviation map (needed only for measure-mode=deviation, zero-method=deviation,
     # or max-crown-dev-range filtering)
@@ -302,10 +331,17 @@ def _candidate_band(rivet_center, hole_radius, pts, kdtree,
                     other_centers, other_radii,
                     mastic_centers, mastic_radii,
                     mastic_bound_tree, mastic_bound_r,
-                    zero_search, crown_buffer):
+                    zero_search, crown_buffer,
+                    excl_other_buffer=10.0):
     """
     Return the index array of candidate zero vertices in the search band,
     after applying all exclusion rules (other rivets, mastic).
+
+    excl_other_buffer: minimum clear distance from any OTHER rivet's hole edge
+    (mm).  Increase to prevent the zero from landing between two rivets.
+    The total exclusion radius from another rivet's centre is
+    other_hole_r + excl_other_buffer.  Default 10 mm (vs legacy 4 mm).
+
     Returns empty array if nothing survives.
     """
     d_min = hole_radius + from_edge_min
@@ -321,7 +357,6 @@ def _candidate_band(rivet_center, hole_radius, pts, kdtree,
     if len(idxs) == 0:
         return np.empty(0, dtype=np.int32)
 
-    probe_r = 4.0
     if other_centers is not None and len(other_centers) > 0:
         keep  = np.ones(len(idxs), dtype=bool)
         extra = crown_buffer if zero_search == "bounded" else 0.0
@@ -329,7 +364,7 @@ def _candidate_band(rivet_center, hole_radius, pts, kdtree,
             if np.linalg.norm(np.asarray(oc[:2]) - rivet_center[:2]) < 1e-3:
                 continue
             d_oc = np.linalg.norm(pts[idxs, :2] - np.asarray(oc[:2]), axis=1)
-            keep &= d_oc > (or_ + extra + probe_r)
+            keep &= d_oc > (or_ + extra + excl_other_buffer)
         idxs = idxs[keep]
 
     if mastic_centers is not None and len(mastic_centers) > 0:
@@ -347,13 +382,14 @@ def _candidate_band(rivet_center, hole_radius, pts, kdtree,
 
 
 def find_zero_point_flatness(rivet_center, hole_radius, pts, kdtree,
-                              from_edge_min=13.0, from_edge_max=60.0,
+                              from_edge_min=20.0, from_edge_max=80.0,
                               feet_radius=13.7,
                               other_centers=None, other_radii=None,
                               mastic_centers=None, mastic_radii=None,
                               mastic_bound_tree=None, mastic_bound_r=3.0,
                               zero_search="free", crown_buffer=0.0,
-                              flatness_radius=3.0, max_candidates=256):
+                              flatness_radius=3.0, max_candidates=256,
+                              excl_other_buffer=10.0):
     """
     Find the zero vertex with minimum local surface roughness.
 
@@ -374,6 +410,7 @@ def find_zero_point_flatness(rivet_center, hole_radius, pts, kdtree,
         mastic_centers, mastic_radii,
         mastic_bound_tree, mastic_bound_r,
         zero_search, crown_buffer,
+        excl_other_buffer=excl_other_buffer,
     )
     if len(idxs) == 0:
         return None, float("inf")
@@ -387,12 +424,13 @@ def find_zero_point_flatness(rivet_center, hole_radius, pts, kdtree,
 
 
 def find_zero_point_deviation(rivet_center, hole_radius, pts, kdtree, deviation,
-                               nominal_thresh=0.10, from_edge_min=13.0, from_edge_max=60.0,
+                               nominal_thresh=0.10, from_edge_min=20.0, from_edge_max=80.0,
                                feet_radius=13.7,
                                other_centers=None, other_radii=None,
                                mastic_centers=None, mastic_radii=None,
                                mastic_bound_tree=None, mastic_bound_r=3.0,
-                               zero_search="free", crown_buffer=0.0):
+                               zero_search="free", crown_buffer=0.0,
+                               excl_other_buffer=10.0):
     """Legacy v1 zeroing: pick vertex with minimum |global deviation| in the search band."""
     idxs = _candidate_band(
         rivet_center, hole_radius, pts, kdtree,
@@ -401,6 +439,7 @@ def find_zero_point_deviation(rivet_center, hole_radius, pts, kdtree, deviation,
         mastic_centers, mastic_radii,
         mastic_bound_tree, mastic_bound_r,
         zero_search, crown_buffer,
+        excl_other_buffer=excl_other_buffer,
     )
     if len(idxs) == 0:
         return None, float("nan")
@@ -410,65 +449,6 @@ def find_zero_point_deviation(rivet_center, hole_radius, pts, kdtree, deviation,
         return pts[idxs[best]].copy(), float(np.abs(deviation[idxs[best]]))
     return None, float("nan")
 
-
-def find_zero_point_learned(rivet_center, hole_radius, pts, kdtree,
-                             model,
-                             from_edge_min=13.0, from_edge_max=60.0,
-                             feet_radius=13.7,
-                             other_centers=None, other_radii=None,
-                             mastic_centers=None, mastic_radii=None,
-                             mastic_bound_tree=None, mastic_bound_r=3.0,
-                             zero_search="free", crown_buffer=0.0,
-                             R_feat=15.0,
-                             n_angular=16, n_radial=5):
-    """
-    Score candidate zero points with a trained Random Forest and return
-    the highest-scoring one.
-
-    model : sklearn Pipeline loaded with joblib from train_zero_selector.py
-    Returns (zero_point, score) or (None, 0.0).
-    """
-    from zero_point_features import (
-        generate_zero_candidates, extract_zero_candidate_features,
-        features_to_array,
-    )
-
-    candidates = generate_zero_candidates(
-        rivet_center, hole_radius, pts, kdtree,
-        from_edge_min=from_edge_min,
-        from_edge_max=from_edge_max,
-        n_angular=n_angular,
-        n_radial=n_radial,
-        other_centers=other_centers,
-        other_radii=other_radii,
-        mastic_centers=mastic_centers,
-        mastic_radii=mastic_radii,
-        feet_radius=feet_radius,
-    )
-    if len(candidates) == 0:
-        return None, 0.0
-
-    feat_rows = []
-    valid_cands = []
-    for p in candidates:
-        feat = extract_zero_candidate_features(
-            p, rivet_center, hole_radius, pts, kdtree,
-            other_centers, other_radii,
-            mastic_centers, mastic_radii,
-            R_feat=R_feat,
-        )
-        if feat is None:
-            continue
-        feat_rows.append(features_to_array(feat))
-        valid_cands.append(p)
-
-    if not feat_rows:
-        return None, 0.0
-
-    X      = np.array(feat_rows)
-    scores = model.predict_proba(X)[:, 1]   # P(oracle class)
-    best   = int(np.argmax(scores))
-    return valid_cands[best].copy(), float(scores[best])
 
 
 def zero_reading_at(zero_center, pts, kdtree, feet_radius, probe_radius,
@@ -516,6 +496,148 @@ def _robust_poly_fit(x, y, z, degree, n_iter=4, reject_sigma=1.5):
         keep = new_keep
     coeffs, _, _, _ = np.linalg.lstsq(A[keep], z[keep], rcond=None)
     return coeffs
+
+
+# ── Local-deviation zeroing (v2 local-dev) ───────────────────────────────────
+
+def compute_local_deviation_patch(rivet_center, pts, kdtree,
+                                   fit_radius,
+                                   all_hole_centers, all_hole_radii,
+                                   pull_in_buffer=2.0,
+                                   poly_degree=2,
+                                   mastic_centers=None,
+                                   mastic_radii=None):
+    """
+    Fit a 2-D polynomial to the surface within fit_radius of rivet_center,
+    excluding pull-in zones (hole_r + pull_in_buffer around every rivet hole)
+    and mastic patches.
+
+    The fit uses only the nominally clean surface so that depressed regions
+    (pull-ins, dents) do not bias the reference downward.
+
+    Returns polynomial coefficients (centred on rivet_center) or None if the
+    fit is underdetermined after exclusions.
+    """
+    all_cand = np.array(kdtree.query_ball_point(rivet_center, fit_radius), dtype=np.int32)
+    if len(all_cand) == 0:
+        return None
+
+    keep = np.ones(len(all_cand), dtype=bool)
+    for hc, hr in zip(all_hole_centers, all_hole_radii):
+        d = np.linalg.norm(pts[all_cand, :2] - np.asarray(hc[:2]), axis=1)
+        keep &= d > (hr + pull_in_buffer)
+    if mastic_centers is not None:
+        for mc, mr in zip(mastic_centers, mastic_radii):
+            d = np.linalg.norm(pts[all_cand, :2] - np.asarray(mc[:2]), axis=1)
+            keep &= d > mr
+
+    fit_idx = all_cand[keep]
+    min_pts = (poly_degree + 1) * (poly_degree + 2) // 2 * 3
+    if len(fit_idx) < min_pts:
+        return None
+
+    cx, cy = float(rivet_center[0]), float(rivet_center[1])
+    xf = pts[fit_idx, 0] - cx
+    yf = pts[fit_idx, 1] - cy
+    coeffs, _, _, _ = np.linalg.lstsq(
+        _poly2d_basis(xf, yf, poly_degree), pts[fit_idx, 2], rcond=None
+    )
+    return coeffs
+
+
+def _eval_local_dev(pts_sub, rivet_center, coeffs, poly_degree):
+    """Signed deviation (Z - Z_ref) for pts_sub using the local polynomial."""
+    cx, cy = float(rivet_center[0]), float(rivet_center[1])
+    z_ref = _poly2d_basis(pts_sub[:, 0] - cx, pts_sub[:, 1] - cy, poly_degree) @ coeffs
+    return pts_sub[:, 2] - z_ref
+
+
+def find_zero_point_local_dev(rivet_center, hole_radius, pts, kdtree,
+                               from_edge_min=20.0, from_edge_max=80.0,
+                               feet_radius=13.7,
+                               other_centers=None, other_radii=None,
+                               mastic_centers=None, mastic_radii=None,
+                               mastic_bound_tree=None, mastic_bound_r=3.0,
+                               zero_search="free", crown_buffer=0.0,
+                               pull_in_buffer=2.0,
+                               local_fit_radius=None,
+                               poly_degree=2,
+                               flatness_radius=3.0,
+                               max_candidates=512,
+                               w_dev=0.5, w_dist=0.3, w_rough=0.2,
+                               dev_scale=0.05,
+                               rough_scale=0.003,
+                               excl_other_buffer=10.0):
+    """
+    Score zero candidates with a composite penalty:
+
+        penalty = w_dev  * |local_dev(p)| / dev_scale        (prefer nominal surface)
+                + w_dist * (d - d_min) / (d_max - d_min)     (prefer closer rivet)
+                + w_rough * local_roughness(p) / rough_scale  (prefer smooth neighbourhood)
+
+    The local deviation is computed from a polynomial fit (degree poly_degree)
+    within local_fit_radius, excluding:
+      - all rivet pull-in zones  (hole_r_i + pull_in_buffer)
+      - mastic patches
+    so the reference surface is never contaminated by the very defects we seek.
+
+    Candidates must already be outside other rivets and mastic (handled by
+    _candidate_band as in other methods).
+
+    Returns (zero_point, penalty) or (None, inf).
+    """
+    if local_fit_radius is None:
+        local_fit_radius = hole_radius + from_edge_max
+
+    all_centers_fit = list(other_centers or []) + [rivet_center]
+    all_radii_fit   = list(other_radii   or []) + [hole_radius]
+
+    coeffs = compute_local_deviation_patch(
+        rivet_center, pts, kdtree,
+        fit_radius=local_fit_radius,
+        all_hole_centers=all_centers_fit,
+        all_hole_radii=all_radii_fit,
+        pull_in_buffer=pull_in_buffer,
+        poly_degree=poly_degree,
+        mastic_centers=mastic_centers,
+        mastic_radii=mastic_radii,
+    )
+
+    idxs = _candidate_band(
+        rivet_center, hole_radius, pts, kdtree,
+        from_edge_min, from_edge_max, feet_radius,
+        other_centers, other_radii,
+        mastic_centers, mastic_radii,
+        mastic_bound_tree, mastic_bound_r,
+        zero_search, crown_buffer,
+        excl_other_buffer=excl_other_buffer,
+    )
+    if len(idxs) == 0:
+        return None, float("inf")
+
+    idxs = _subsample_angular(pts, rivet_center, idxs, max_candidates)
+
+    d2d   = np.linalg.norm(pts[idxs, :2] - rivet_center[:2], axis=1)
+    d_span = max(from_edge_max - from_edge_min, 1.0)
+    d_norm = np.clip((d2d - from_edge_min) / d_span, 0.0, 1.0)
+
+    if coeffs is not None:
+        dev = _eval_local_dev(pts[idxs], rivet_center, coeffs, poly_degree)
+    else:
+        # Fallback when fit fails: deviation relative to median Z
+        dev = pts[idxs, 2] - np.median(pts[idxs, 2])
+
+    dev_norm  = np.abs(dev) / dev_scale
+    roughness = _local_roughness_batch(pts, kdtree, idxs, flatness_radius)
+    rough_norm = roughness / rough_scale
+
+    penalty = w_dev * dev_norm + w_dist * d_norm + w_rough * rough_norm
+
+    best = int(np.argmin(penalty))
+    if np.isinf(roughness[best]):
+        return None, float("inf")
+
+    return pts[idxs[best]].copy(), float(penalty[best])
 
 
 # ── Crown measurement (unchanged from v1) ────────────────────────────────────
@@ -996,6 +1118,122 @@ def make_zero_plot(pts, mastics, results, label, out_path, args):
     plt.close(fig)
 
 
+# ── Zero feasibility plot ─────────────────────────────────────────────────────
+def make_zero_feasibility_plot(pts, holes, mastics, results, label, out_path, args):
+    """
+    Top-down map showing for each rivet:
+      • Gray filled circle      = rivet hole (forbidden zone)
+      • Red semi-transparent    = exclusion halo around every rivet
+                                  (zero_excl_other_buffer mm from hole edge)
+                                  — no other rivet can zero inside this ring
+      • Orange dashed ring      = inner search boundary (zero_from_edge_min)
+      • Blue dashed ring        = outer search boundary (zero_from_edge_max)
+      • Cyan cross + dashed line = selected zero point → rivet
+      • Orange fill             = mastic zones
+    The valid zero region for a given rivet is the annular band [min, max]
+    minus the red exclusion halos of all other rivets.
+    """
+    step = max(1, len(pts) // 300_000)
+    fig, ax = plt.subplots(figsize=(14, 12))
+    zero_method_str = getattr(args, "zero_method", "?")
+    excl_buf = getattr(args, "zero_excl_other_buffer", 10.0)
+    d_min    = getattr(args, "zero_from_edge_min", 20.0)
+    d_max    = getattr(args, "zero_from_edge_max", 80.0)
+    fig.suptitle(
+        f"Zero feasibility map  —  {label}  (method={zero_method_str})\n"
+        f"Red halo = exclusion {excl_buf:.0f} mm from hole edge  |  "
+        f"Orange ring = min {d_min:.0f} mm  |  Blue ring = max {d_max:.0f} mm",
+        fontsize=10, fontweight="bold",
+    )
+
+    # Surface point cloud
+    ax.scatter(pts[::step, 0], pts[::step, 1], c=pts[::step, 2],
+               s=0.08, cmap="gray", rasterized=True, alpha=0.35, zorder=1)
+
+    # Mastic zones
+    for m in mastics:
+        mv = pts[m["verts"]]
+        ax.scatter(mv[:, 0], mv[:, 1], s=1.5, c="orange",
+                   alpha=0.5, linewidths=0, zorder=2)
+
+    # Per-rivet geometry
+    for hole in holes:
+        c  = hole["center"]
+        hr = hole["radius_mm"]
+
+        # Red exclusion halo (other rivets cannot zero inside this circle)
+        ax.add_patch(plt.Circle((c[0], c[1]), hr + excl_buf,
+                                color="tomato", fill=True, alpha=0.18,
+                                linewidth=0, zorder=3))
+        ax.add_patch(plt.Circle((c[0], c[1]), hr + excl_buf,
+                                color="red", fill=False, linewidth=0.6,
+                                linestyle="-", alpha=0.5, zorder=4))
+
+        # Orange dashed ring: min search distance (for THIS rivet as current)
+        ax.add_patch(plt.Circle((c[0], c[1]), hr + d_min,
+                                color="darkorange", fill=False, linewidth=0.7,
+                                linestyle="--", alpha=0.45, zorder=4))
+
+        # Blue dashed ring: max search distance
+        ax.add_patch(plt.Circle((c[0], c[1]), hr + d_max,
+                                color="steelblue", fill=False, linewidth=0.5,
+                                linestyle=":", alpha=0.3, zorder=4))
+
+        # Gray filled hole
+        ax.add_patch(plt.Circle((c[0], c[1]), hr,
+                                color="dimgray", fill=True, alpha=0.85,
+                                linewidth=0, zorder=5))
+
+    # Selected zero points
+    zero_dists = []
+    for r in results:
+        c  = r["center"]
+        zc = r.get("zero_center")
+        col = _rivet_col(r, args)
+
+        # Rivet circle coloured by result
+        ax.add_patch(plt.Circle((c[0], c[1]), r["hole_r"],
+                                color=col, fill=True, alpha=0.9,
+                                linewidth=0, zorder=6))
+
+        if zc is not None:
+            d = float(np.linalg.norm(np.array(zc[:2]) - np.array(c[:2])))
+            zero_dists.append(d)
+            ax.plot([c[0], zc[0]], [c[1], zc[1]],
+                    color="cyan", alpha=0.6, linewidth=0.7,
+                    linestyle="--", zorder=7)
+            ax.plot(zc[0], zc[1], marker="+", ms=6, color="cyan",
+                    lw=0, markeredgewidth=1.4, zorder=8)
+        else:
+            # No zero found — mark rivet with gray X
+            ax.plot(c[0], c[1], marker="x", ms=5, color="gray",
+                    lw=0, markeredgewidth=1.2, zorder=8)
+
+    n_no_zero = sum(1 for r in results if r.get("zero_center") is None)
+    if zero_dists:
+        title = (f"zero→rivet dist:  med={np.median(zero_dists):.1f} mm  "
+                 f"max={max(zero_dists):.1f} mm  |  senza zero: {n_no_zero}")
+    else:
+        title = f"Nessun punto di zero trovato  (senza zero: {n_no_zero})"
+
+    legend_elems = [
+        mpatches.Patch(color="tomato",     alpha=0.5, label=f"Exclusion halo ({excl_buf:.0f} mm from edge)"),
+        mpatches.Patch(color="darkorange", alpha=0.6, label=f"Min search dist ({d_min:.0f} mm from edge)"),
+        mpatches.Patch(color="steelblue",  alpha=0.5, label=f"Max search dist ({d_max:.0f} mm from edge)"),
+        mpatches.Patch(color="limegreen",  label="Rivet OK"),
+        mpatches.Patch(color="red",        label="Rivet DEFECT"),
+        plt.Line2D([0], [0], color="cyan", lw=1.2, label="Zero point + line"),
+    ]
+    ax.legend(handles=legend_elems, fontsize=7, loc="upper right")
+    ax.set_aspect("equal")
+    ax.set_title(title, fontsize=8)
+    ax.set_xlabel("X (mm)"); ax.set_ylabel("Y (mm)")
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+
 # ── Interactive plot ──────────────────────────────────────────────────────────
 def make_interactive_plot(pts, holes, mastics, results, threshold, label, out_path, args):
     import plotly.graph_objects as go
@@ -1154,8 +1392,13 @@ def main():
           f"from edge [{args.zero_from_edge_min},{args.zero_from_edge_max}] mm")
     if args.zero_method == "flatness":
         print(f"           flatness_radius={args.zero_flatness_radius} mm")
-    elif args.zero_method == "learned":
-        print(f"           model={args.zero_model}")
+    elif args.zero_method == "local-dev":
+        fit_r_str = f"{args.zero_local_fit_radius:.0f}" if args.zero_local_fit_radius else "auto"
+        print(f"           pull_in_buffer={args.zero_pull_in_buffer} mm  "
+              f"local_fit_radius={fit_r_str} mm")
+        print(f"           weights  dev={args.zero_dev_weight}  "
+              f"dist={args.zero_dist_weight}  rough={args.zero_rough_weight}  "
+              f"(scales dev={args.zero_dev_scale} mm  rough={args.zero_rough_scale} mm)")
     print(f"{'='*68}")
 
     # ── Load ──────────────────────────────────────────────────────────────────
@@ -1213,16 +1456,6 @@ def main():
     print(f"    Mastic zones for exclusion: {len(mastic_centers)}/{len(mastics)} "
           f"(radius < {MASTIC_R_MAX} mm)")
 
-    # ── Load learned model if needed ─────────────────────────────────────────
-    _learned_model = None
-    if args.zero_method == "learned":
-        import joblib
-        if not args.zero_model:
-            print("ERROR: --zero-method learned requires --zero-model <path>")
-            return
-        _learned_model = joblib.load(args.zero_model)
-        print(f"[4b] Learned zero model loaded from {args.zero_model}")
-
     # ── Measure each rivet ────────────────────────────────────────────────────
     print(f"\n[5] Measuring {len(holes)} rivets …")
     results, skipped, no_zero = [], 0, 0
@@ -1234,8 +1467,29 @@ def main():
         other_c = [all_centers[j] for j in range(len(holes)) if j != i]
         other_r = [all_radii[j]   for j in range(len(holes)) if j != i]
 
-        # --- Auto-zero (v2: flatness / deviation / learned) ---
-        if args.zero_method == "flatness":
+        # --- Auto-zero ---
+        if args.zero_method == "local-dev":
+            zero_pt, zero_roughness = find_zero_point_local_dev(
+                c, r, pts, kdtree,
+                from_edge_min=args.zero_from_edge_min,
+                from_edge_max=args.zero_from_edge_max,
+                feet_radius=args.feet_radius,
+                other_centers=other_c,
+                other_radii=other_r,
+                mastic_centers=mastic_centers,
+                mastic_radii=mastic_radii,
+                pull_in_buffer=args.zero_pull_in_buffer,
+                local_fit_radius=args.zero_local_fit_radius,
+                poly_degree=args.local_poly_degree,
+                flatness_radius=args.zero_flatness_radius,
+                w_dev=args.zero_dev_weight,
+                w_dist=args.zero_dist_weight,
+                w_rough=args.zero_rough_weight,
+                dev_scale=args.zero_dev_scale,
+                rough_scale=args.zero_rough_scale,
+                excl_other_buffer=args.zero_excl_other_buffer,
+            )
+        elif args.zero_method == "flatness":
             zero_pt, zero_roughness = find_zero_point_flatness(
                 c, r, pts, kdtree,
                 from_edge_min=args.zero_from_edge_min,
@@ -1246,18 +1500,7 @@ def main():
                 mastic_centers=mastic_centers,
                 mastic_radii=mastic_radii,
                 flatness_radius=args.zero_flatness_radius,
-            )
-        elif args.zero_method == "learned":
-            zero_pt, zero_roughness = find_zero_point_learned(
-                c, r, pts, kdtree,
-                model=_learned_model,
-                from_edge_min=args.zero_from_edge_min,
-                from_edge_max=args.zero_from_edge_max,
-                feet_radius=args.feet_radius,
-                other_centers=other_c,
-                other_radii=other_r,
-                mastic_centers=mastic_centers,
-                mastic_radii=mastic_radii,
+                excl_other_buffer=args.zero_excl_other_buffer,
             )
         else:
             zero_pt, zero_roughness = find_zero_point_deviation(
@@ -1305,6 +1548,8 @@ def main():
             local_poly_fit_radius=args.local_poly_fit_radius,
             local_poly_degree=args.local_poly_degree,
             local_poly_method=args.local_poly_method,
+            n_beams=args.n_beams,
+            beam_noise_sigma=args.beam_noise_sigma,
         )
         if res is None:
             skipped += 1
@@ -1352,14 +1597,20 @@ def main():
               f"{r['feet_r']:>5.1f}  "
               f"{r['foot_max_dist']:>5.2f}  {flag}")
 
-    # Zero roughness summary
+    # Zero quality summary
     zr_vals = [r["zero_roughness"] for r in results
                if r.get("zero_roughness") is not None and np.isfinite(r["zero_roughness"])]
     if zr_vals:
-        print(f"\n  Zero roughness (flatness at zero point):")
-        print(f"    median={np.median(zr_vals)*1e3:.2f} µm  "
-              f"p90={np.percentile(zr_vals, 90)*1e3:.2f} µm  "
-              f"max={max(zr_vals)*1e3:.2f} µm")
+        if args.zero_method == "local-dev":
+            print(f"\n  Zero quality (composite penalty — lower = better zero):")
+            print(f"    median={np.median(zr_vals):.3f}  "
+                  f"p90={np.percentile(zr_vals, 90):.3f}  "
+                  f"max={max(zr_vals):.3f}")
+        else:
+            print(f"\n  Zero roughness (flatness at zero point):")
+            print(f"    median={np.median(zr_vals)*1e3:.2f} µm  "
+                  f"p90={np.percentile(zr_vals, 90)*1e3:.2f} µm  "
+                  f"max={max(zr_vals)*1e3:.2f} µm")
 
     print(f"\n  Rivets measured : {len(results)}")
     print(f"  Defects flagged : {len(defects)}  ({100*len(defects)/len(results):.1f}%)")
@@ -1376,6 +1627,9 @@ def main():
     print(f"\n  CSV  → {csv_path}")
 
     # ── Plots ─────────────────────────────────────────────────────────────────
+    zeroing_dir = args.zeroing_out_dir if args.zeroing_out_dir else args.out_dir
+    os.makedirs(zeroing_dir, exist_ok=True)
+
     if args.plots:
         print("[6] Static plot …")
         out_png = os.path.join(args.out_dir, f"{label}_comparator_v2.png")
@@ -1383,9 +1637,15 @@ def main():
                          args.threshold, label, out_png, args)
         print(f"    → {out_png}")
 
-        out_zero = os.path.join(args.out_dir, f"{label}_zero_v2.png")
+        # Zeroing plots go to dedicated dir (separate from rivet-result plots)
+        out_zero = os.path.join(zeroing_dir, f"{label}_zero_positions.png")
         make_zero_plot(pts, mastics, results, label, out_zero, args)
         print(f"    → {out_zero}")
+
+        out_feasibility = os.path.join(zeroing_dir, f"{label}_zero_feasibility.png")
+        make_zero_feasibility_plot(pts, holes, mastics, results, label,
+                                   out_feasibility, args)
+        print(f"    → {out_feasibility}")
 
     if args.interactive:
         print("[7] Interactive plot …")
